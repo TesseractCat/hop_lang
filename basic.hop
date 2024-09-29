@@ -1,0 +1,16 @@
+set Liftable (struct [
+    lift: Function
+]);
+set Index (struct [
+    get: Function
+]);
+set Dumbell (struct [
+    weight: Number
+]);
+push Dumbell Liftable([
+    lift: (fn [this: Dumbell, strength: Number] Void { print strength; })
+]);
+set test Dumbell([
+    weight: 5
+]);
+test.lift(2);

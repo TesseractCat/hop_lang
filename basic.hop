@@ -1,16 +1,33 @@
-set Liftable (struct [
-    lift: Function
-]);
-set Index (struct [
-    get: Function
-]);
 set Dumbell (struct [
     weight: Number
 ]);
-push Dumbell Liftable([
-    lift: (fn [this: Dumbell, strength: Number] Void { print strength; })
+set Cat (struct [
+    cuteness: Number
 ]);
-set test Dumbell([
+set Liftable (struct [
+    lift: Function
+]);
+def lift (fn [this: Dumbell, strength: Number] Number { print "oof"; print this.weight; });
+def lift (fn [this: Cat, strength: Number] Number { print "meow"; print this.cuteness; });
+print lift;
+
+def Horse (fn [carrying: Type] Type {
+    struct [
+        load: carrying,
+        name: String
+    ]
+});
+set test (call Horse(Number) [load: 5, name: "hoofy"]);
+print (call Horse Number);
+print test;
+
+set foo Dumbell([
     weight: 5
 ]);
-test.lift(2);
+set bar Cat([
+    cuteness: 9001
+]);
+lift(foo 2);
+lift(bar 2);
+
+//set lift_any (fn [this: Liftable, strength: Number] { print lift(this strength); })

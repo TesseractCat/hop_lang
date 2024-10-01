@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+codespan-reporting = "0.11.1"
 enum-as-inner = "0.6.1"
 indexmap = "2.5.0"
 logos = "0.14.2"
-slotmap = "1.0.7"
 smol_str = "0.3.1"
 thiserror = "1.0.64"

@@ -1,0 +1,8 @@
+def fib (fn [n: Number] Number {
+    if (lt n 2) n else (+ fib.((- n 1)) fib.((- n 2)))
+});
+
+set x 30;
+print "Calculating fib";
+print x;
+fib.(x)

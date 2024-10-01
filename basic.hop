@@ -7,27 +7,53 @@ set Cat (struct [
 set Liftable (struct [
     lift: Function
 ]);
-def lift (fn [this: Dumbell, strength: Number] Number { print "oof"; print this.weight; });
-def lift (fn [this: Cat, strength: Number] Number { print "meow"; print this.cuteness; });
+def lift (fn [this: Dumbell, strength: Number] Number { print "oof"; print this.weight; 0 });
+def lift (fn [this: Dumbell, cat: Cat] Number { print "meoof"; print cat.cuteness; 0 });
+def lift (fn [this: Cat, strength: Number] Number { print "meow"; print this.cuteness; 0 });
 print lift;
 
+//print (List Number).((_ 1 2 3 4));
+//def count (fn [this: (imp next)] Number ) {...}
+//def biggest (fn [vec: List.((imp cmp))] Number ) {...}
+def eq (fn [a: (List (imp eq)), b: (List (imp eq))] Bool {
+    if (eq length.(a) length.(b)) {
+        set yes true;
+        for i in range(length.(a)) {
+            if (neq get.(a i) get.(b i)) {
+                set yes false;
+            }
+        };
+        yes
+    } else {
+        false
+    }
+});
+
 def Horse (fn [carrying: Type] Type {
-    struct [
+    set ty (struct [
         load: carrying,
         name: String
-    ]
+    ]);
 });
-set test (call Horse(Number) [load: 5, name: "hoofy"]);
-print (call Horse Number);
+def eq (fn [a: (Horse (imp eq)), b: (Horse (imp eq))] {
+    (eq a.load b.load)
+});
+print Horse.(Number).([load: 6, name: "meowy"]).name;
+set test (call Horse.(Number) [load: 5, name: "hoofy"]);
+print Horse.(Number);
 print test;
 
-set foo Dumbell([
+set foo Dumbell.([
     weight: 5
 ]);
-set bar Cat([
+set bar Cat.([
     cuteness: 9001
 ]);
-lift(foo 2);
-lift(bar 2);
+lift.(foo 2);
+lift bar 2;
+lift foo bar;
+
+set x 0;
+loop {print x; set x (+ x 1);};
 
 //set lift_any (fn [this: Liftable, strength: Number] { print lift(this strength); })

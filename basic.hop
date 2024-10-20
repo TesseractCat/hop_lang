@@ -14,7 +14,14 @@ print lift;
 
 //print (List Number).((_ 1 2 3 4));
 //def count (fn [this: (imp next)] Number ) {...}
-//def biggest (fn [vec: List.((imp cmp))] Number ) {...}
+//def biggest1 (fn [vec: (List (imp cmp))] Number ) {...}
+//def biggest2 (fn [T: (imp cmp), L: (List T)] [vec: L] Number ) {...}
+//def biggest3 (fn [vec: (imp get -> (imp first -> Number last -> Bool)), test: (imp ident -> Number)] Number ) {...}
+//def biggest3 (fn [vec: [get: [first: Number, last: Bool]], test: Number] Number ) {...}
+//def count (fn [this: next -> Any] Number { })
+//def biggest4 (fn [vec: get Number -> (cmp _ _) len, tuple: first -> Number last -> Bool] -> Number)
+//def clonelist (fn [list: ((len _ Number) (get _ Number ((clone))))])
+//def liftany (fn [this: ((lift _ Number to Number))])
 def eq (fn [a: (List (imp eq)), b: (List (imp eq))] Bool {
     if (eq length.(a) length.(b)) {
         set yes true;
@@ -35,13 +42,15 @@ def Horse (fn [carrying: Type] Type {
         name: String
     ]);
 });
-def eq (fn [a: (Horse (imp eq)), b: (Horse (imp eq))] {
-    (eq a.load b.load)
-});
-print Horse.(Number).([load: 6, name: "meowy"]).name;
-set test (call Horse.(Number) [load: 5, name: "hoofy"]);
-print Horse.(Number);
-print test;
+//def eq (fn [a: (Horse (imp eq)), b: (Horse (imp eq))] {
+//    (eq a.load b.load)
+//});
+//print Horse.(Number).([load: 6, name: "meowy"]).name;
+//set test (call Horse.(Number) [load: 5, name: "hoofy"]);
+//print Horse.(Number);
+//print test;
+
+//print (+ 5 "meow");
 
 set foo Dumbell.([
     weight: 5
@@ -49,11 +58,13 @@ set foo Dumbell.([
 set bar Cat.([
     cuteness: 9001
 ]);
-lift.(foo 2);
+lift foo 2;
 lift bar 2;
 lift foo bar;
+//foo foo bar;
 
-set x 0;
-loop {print x; set x (+ x 1);};
+//set x 0;
+//loop {print x; set x (+ x 1);};
 
-//set lift_any (fn [this: Liftable, strength: Number] { print lift(this strength); })
+def liftany (fn [this: (imp lift), strength: Number] Number { print (lift this strength); 0 });
+liftany foo 2;

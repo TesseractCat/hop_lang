@@ -1,0 +1,33 @@
+set Dumbell (struct [
+    weight: Number
+]);
+set Cat (struct [
+    cuteness: Number
+]);
+set Building (struct [
+    height: Number
+]);
+def lift (fn [this: Dumbell, strength: Number] Number { print "oof"; print this.weight; 0 });
+def lift (fn [this: Cat, strength: Number] Number { print "meow"; print this.cuteness; 0 });
+def liftany (fn [this: ((lift _ Number Number)), strength: Number] Number { lift this strength });
+
+def getval (fn [this: Dumbell] Number { this.weight });
+def getval (fn [this: Cat] Number { this.cuteness });
+def getval (fn [this: Number] Number { this });
+
+def eq (fn [a: Number, b: Number] Bool { = a b });
+//def eqany (fn [T: ((eq _ _))] [a: T, b: T] Bool { eq a b });?
+def eqval (fn [a: ((getval _ Number)), b: ((getval _ Number))] Bool { eq (getval a) (getval b) });
+
+set foo Dumbell.([
+    weight: 5
+]);
+set bar Cat.([
+    cuteness: 9001
+]);
+set baz Building.([
+    height: 100
+]);
+lift foo 2;
+liftany bar 2;
+print (eqval foo 5);

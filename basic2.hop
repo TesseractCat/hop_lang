@@ -7,17 +7,26 @@ set Cat (struct [
 set Building (struct [
     height: Number
 ]);
-def lift (fn [this: Dumbell, strength: Number] Number { print "oof"; print this.weight; 0 });
-def lift (fn [this: Cat, strength: Number] Number { print "meow"; print this.cuteness; 0 });
-def liftany (fn [this: ((lift _ Number Number)), strength: Number] Number { lift this strength });
+def lift (fn [this: Dumbell, strength: Number] -> Number { print "oof"; print this.weight; 0 });
+def lift (fn [this: Cat, strength: Number] -> Number { print "meow"; print this.cuteness; 0 });
+def liftany (fn [this: imp (lift _ Number -> Number), strength: Number] -> Number {
+    lift this strength
+});
+def lifttwo (fn [a: imp (lift _T Number -> Number), b: imp (lift _T Number -> Number), strength: Number] -> Number {
+    lift a strength;
+    lift b strength
+});
+//def liftany (fn [this: imp (lift _ -> Number), strength: Number] -> Number { lift this strength });
+//def mergelists (fn [a: imp next _ -> (imp cmp _T _T -> Bool), b: imp next _ -> (imp cmp _T _T -> Bool)])
+//def mergelists (fn [a: List Number, b: List String] { mergelists a b })
 
-def getval (fn [this: Dumbell] Number { this.weight });
-def getval (fn [this: Cat] Number { this.cuteness });
-def getval (fn [this: Number] Number { this });
+def getval (fn [this: Dumbell] -> Number { this.weight });
+def getval (fn [this: Cat] -> Number { this.cuteness });
+def getval (fn [this: Number] -> Number { this });
 
-def eq (fn [a: Number, b: Number] Bool { = a b });
-//def eqany (fn [T: ((eq _ _))] [a: T, b: T] Bool { eq a b });?
-def eqval (fn [a: ((getval _ Number)), b: ((getval _ Number))] Bool { eq (getval a) (getval b) });
+def eq (fn [a: Number, b: Number] -> Bool { = a b });
+//def eqany (fn [T: ((eq _ _))] [a: T, b: T] -> Bool { eq a b });?
+def eqval (fn [a: imp (getval _ -> Number), b: imp (getval _ -> Number)] -> Bool { eq (getval a) (getval b) });
 
 set foo Dumbell.([
     weight: 5
@@ -30,4 +39,6 @@ set baz Building.([
 ]);
 lift foo 2;
 liftany bar 2;
+print "LIFTING TWO";
+lifttwo bar bar 69;
 print (eqval foo 5);

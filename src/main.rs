@@ -75,6 +75,11 @@ enum Token {
     #[token(")")]
     ListClose,
 
+    #[token("<")]
+    InfixOpen,
+    #[token(">")]
+    InfixClose,
+
     #[token("[")]
     TableOpen,
     #[token("]")]
@@ -100,7 +105,7 @@ enum Token {
     })]
     String(SmolStr),
 
-    #[regex(r#"[a-zA-Z\-\/+_=]+"#, |lex| SmolStr::from(lex.slice()))]
+    #[regex(r#"[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| SmolStr::from(lex.slice()))]
     Symbol(SmolStr),
 
     // Sugar
@@ -119,7 +124,7 @@ struct Implementation {
 }
 #[derive(Debug, PartialEq, Clone, EnumAsInner)]
 enum Type {
-    Placeholder,
+    Placeholder(Option<SmolStr>),
     Type,
     Symbol,
     Bool,
@@ -134,14 +139,13 @@ enum Type {
     Implements(Vec<Implementation>),
 
     Method {
-        param_names: Vec<SmolStr>,
         params: Vec<Type>,
         ret: Box<Type>
     },
     Struct(Box<SpanNode>)
 }
 impl Type {
-    pub fn compatible(self: &Type, rhs: &Type, env: &Environment) -> bool {
+    pub fn compatible(self: &Type, rhs: &Type, env: &Environment, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
         if self == rhs { return true; }
         match self {
             Self::Untyped => true,
@@ -152,25 +156,49 @@ impl Type {
                             let list = list.borrow();
                             let list = list.iter().map(|l| l.node.as_method().unwrap());
 
+                            let mut found_match = false;
                             'outer: for method in list {
                                 let method = method.borrow();
                                 match &*method {
-                                    Method::Hop { ty, .. } => {
+                                    Method::Rust { ty, .. } | Method::Hop { ty, .. } => {
                                         let method_ty = ty.as_method().unwrap();
-                                        if imp.params.len() != method_ty.1.len() { continue; }
-                                        if !imp.ret.compatible(method_ty.2, env) { continue; }
-                                        for (a, b) in imp.params.iter().zip(method_ty.1.iter()) {
-                                            let a = if *a == Type::Placeholder {
-                                                rhs
-                                            } else { a };
-                                            if !a.compatible(b, env) { continue 'outer; }
+                                        //println!("CHECKING METHOD {method_ty:?}");
+                                        // First check arity and return type to quickly eliminate invalid matches
+                                        if imp.params.len() != method_ty.0.len() { continue; }
+                                        if !imp.ret.compatible(method_ty.1, env, placeholder_matches) { continue; }
+                                        // Then check all parameters in order
+                                        for (a, b) in imp.params.iter().zip(method_ty.0.iter()) {
+                                            // If we have a placeholder, fill it
+                                            let a = match *a {
+                                                // Empty placeholders automatically get filled with the matched type
+                                                Type::Placeholder(None) => rhs,
+                                                // Named placeholders get filled the first time they match
+                                                Type::Placeholder(Some(ref placeholder_name)) => {
+                                                    // If it's already filled, use that type
+                                                    if let Some(pt) = placeholder_matches.get(placeholder_name) {
+                                                        if pt != rhs {
+                                                            continue 'outer;
+                                                        } else {
+                                                            rhs
+                                                        }
+                                                    } else {
+                                                        placeholder_matches.insert(placeholder_name.clone(), rhs.clone());
+                                                        rhs
+                                                    }
+                                                },
+                                                _ => a
+                                            };
+                                            // println!("{a} vs. {b} ULTIMATE SHOWDOWN");
+                                            // println!("RESULT!!!! {}", a.compatible(b, env, placeholder_matches));
+                                            if !a.compatible(b, env, placeholder_matches) { continue 'outer; }
                                         }
-                                        return true;
-                                    },
-                                    Method::Rust(_) => todo!()
+                                        // println!("FOUND MATCH!!!!");
+                                        found_match = true;
+                                        break 'outer;
+                                    }
                                 }
                             }
-                            return false;
+                            if !found_match { return false; }
                         } else {
                             return false;
                         }
@@ -241,11 +269,15 @@ impl<T: Display> Display for Reference<T> {
 type Callback = dyn Fn(std::vec::IntoIter<SpanNode>, &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError>;
 enum Method {
     Hop {
+        param_names: Vec<SmolStr>,
         env: Rc<RefCell<Environment>>,
         body: Box<SpanNode>,
         ty: Type
     },
-    Rust(Box<Callback>)
+    Rust {
+        callback: Box<Callback>,
+        ty: Type
+    }
 }
 impl Debug for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -411,43 +443,67 @@ fn parse_deref(lexer: &mut Lexer<'_, Token>, lhs: SpanNode) -> Result<SpanNode, 
 }
 // [a: "hi", b: 2]
 fn parse_table(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
-    let mut res: IndexMap<SmolStr, SpanNode> = IndexMap::new();
+    let mut table: IndexMap<SmolStr, SpanNode> = IndexMap::new();
     let mut want_key = true;
     let mut key: SmolStr = SmolStr::default();
 
+    let mut res: Vec<SpanNode> = Vec::new();
     while let Some(Ok(token)) = lexer.next() {
         if want_key {
-            want_key = false;
             match token {
-                Token::TableClose => return Ok(Node::new_table(lexer.span(), Reference::new(res))),
                 Token::Symbol(str) => key = str.into(),
-                Token::Colon | Token::Comma => want_key = true,
+                Token::Colon | Token::Comma => {
+                    want_key = false;
+                },
                 token => return Err(ParseError::ExpectedSymbol { got: token, span: lexer.span() })
             };
         } else {
-            want_key = true;
             match token {
-                Token::ListOpen => {res.insert(mem::take(&mut key), parse_list(lexer)?);},
-                Token::BlockOpen => {res.insert(mem::take(&mut key), parse_block(lexer)?);},
-                Token::TableOpen => {res.insert(mem::take(&mut key), parse_table(lexer)?);},
+                Token::ListOpen => res.push(parse_list(lexer)?),
+                Token::BlockOpen => res.push(parse_block(lexer)?),
+                Token::TableOpen => res.push(parse_table(lexer)?),
     
-                Token::Bool(bool) => {res.insert(mem::take(&mut key), Node::new_bool(lexer.span(), bool));},
-                Token::Number(num) => {res.insert(mem::take(&mut key), Node::new_number(lexer.span(), num));},
-                Token::String(str) => {res.insert(mem::take(&mut key), Node::new_string(lexer.span(), str));},
-                Token::Symbol(str) => {res.insert(mem::take(&mut key), Node::new_symbol(lexer.span(), str));},
+                Token::Bool(bool) => res.push(Node::new_bool(lexer.span(), bool)),
+                Token::Number(num) => res.push(Node::new_number(lexer.span(), num)),
+                Token::String(str) => res.push(Node::new_string(lexer.span(), str)),
+                Token::Symbol(str) => res.push(Node::new_symbol(lexer.span(), str)),
 
-                // Token::Deref => {
-                //     assert!(res.len() > 1);
-                //     let lhs = res.remove(res.len() - 1);
-                //     res.insert(mem::take(&mut key), parse_deref(lexer, Node::Symbol(str))?);
-                // },
+                Token::Call => {
+                    if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
+                    let lhs = res.remove(res.len() - 1);
+                    res.push(parse_call(lexer, lhs)?)
+                },
+                Token::Deref => {
+                    if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
+                    let lhs = res.remove(res.len() - 1);
+                    res.push(parse_deref(lexer, lhs)?)
+                },
 
-                Token::Colon | Token::Comma => want_key = false,
+                Token::Colon | Token::Comma => {
+                    if res.len() == 1 {
+                        table.insert(mem::take(&mut key), mem::take(&mut res).into_iter().next().unwrap());
+                    } else {
+                        table.insert(mem::take(&mut key), Node::new_list(
+                            lexer.span(), Reference::new(mem::take(&mut res))
+                        ));
+                    }
+                    want_key = true;
+                },
+                Token::TableClose => {
+                    if res.len() == 1 {
+                        table.insert(mem::take(&mut key), mem::take(&mut res).into_iter().next().unwrap());
+                    } else {
+                        table.insert(mem::take(&mut key), Node::new_list(
+                            lexer.span(), Reference::new(mem::take(&mut res))
+                        ));
+                    }
+                    return Ok(Node::new_table(lexer.span(), Reference::new(table)))
+                },
                 token => return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
             };
         }
     }
-    Ok(Node::new_table(lexer.span(), Reference::new(res)))
+    Ok(Node::new_table(lexer.span(), Reference::new(table)))
 }
 // (a 123 false)
 fn parse_list(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
@@ -597,7 +653,7 @@ impl Environment {
         }
     }
     fn def(&mut self, name: SmolStr, func: Box<Callback>) {
-        let func = Node::new_method(Default::default(), Reference::new(Method::Rust(func)));
+        let func = Node::new_method(Default::default(), Reference::new(Method::Rust { callback: func, ty: Type::Untyped }));
         if self.has(&name) {
             self.get(&name).unwrap().into_list().unwrap().borrow_mut().push(func);
         } else {
@@ -610,7 +666,7 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
     if let NodeValue::List(methods) = func.node {
         let methods: Vec<Reference<Method>> = methods.borrow().iter().cloned().map(|m| m.into_method().unwrap()).collect();
         
-        let rust_func = methods.first().map(|m| matches!(*m.borrow(), Method::Rust(_))).unwrap_or_default();
+        let rust_func = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { .. })).unwrap_or_default();
         let (call_tys, call_args): (Vec<_>, Vec<_>) =
             args.map(|arg| {
                 if rust_func {
@@ -623,22 +679,32 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
             .collect::<Result<Vec<_>, _>>()?
             .into_iter().unzip();
 
+        //println!("Searching for method match!");
         for method in methods {
             let borrowed = method.borrow();
             match &*borrowed {
-                Method::Hop { env, body, ty } => {
+                Method::Hop { param_names, env, body, ty } => {
                     let method_ty = ty.clone().into_method().unwrap();
-                    let method_param_names = method_ty.0;
-                    let method_param_tys = method_ty.1;
-                    let method_ret_ty = method_ty.2;
+                    let method_param_names = param_names;
+                    let method_param_tys = method_ty.0;
+                    let method_ret_ty = method_ty.1;
                     let param_count = method_param_names.len();
 
-                    // println!("Searching for method match!");
-                    // println!(" - {:?} vs. {:?}", call_tys, method_param_tys);
+                    if param_count != call_tys.len() { continue; }
+
+                    //println!(" - {:?} vs. {:?}", call_tys, method_param_tys);
 
                     // Method match
+                    let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
                     if method_param_tys.iter().zip(&call_tys)
-                        .filter(|&(a, b)| a.compatible(b, &*env.borrow())).count() == param_count
+                        .filter(|&(a, b)| {
+                            if a.compatible(b, &*env.borrow(), &mut placeholder_matches) {
+                                true
+                            } else {
+                                //println!("    - {a} not compatible with {b}");
+                                false
+                            }
+                        }).count() == param_count
                     {
                         // Call method
                         // Create a new scope
@@ -661,7 +727,7 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
                         };
                     }
                 },
-                Method::Rust(f) => return f(call_args.into_iter(), env)
+                Method::Rust { callback, .. } => return callback(call_args.into_iter(), env)
             }
         }
         return Err(EvalError::NoMethodMatches { span: func_symbol.tag });
@@ -873,6 +939,8 @@ fn main() {
     }));
     global_env.def("fn".into(), Box::new(|mut args, env| {
         let params = args.next().unwrap(); // let params = eval(args.next().unwrap(), env)?;
+        let arrow = args.next().unwrap();
+        arrow.node.as_symbol().filter(|s| **s == "->").ok_or(EvalError::Generic(arrow.tag))?;
         let ret_ty = eval(args.next().unwrap(), env)?;
         let block = args.next().unwrap();
 
@@ -885,48 +953,19 @@ fn main() {
         let params = params.borrow();
 
         let parse_param_type = |node: &SpanNode| -> Result<Type, EvalError> {
-            if node.is_symbol() {
-                Ok(eval(node.clone(), env)?.into_type().unwrap())
-            } else if node.is_list() {
-                let mut implementations = Vec::new();
-                for elem in node.node.as_list().unwrap().borrow().iter() {
-                    let elem = elem.node.as_list().unwrap();
-                    let elem = elem.borrow();
-                    let mut elem = elem.iter();
-
-                    let func_name = elem.next().unwrap().node.as_symbol().unwrap().clone();
-                    let mut types: Vec<Type> = elem.map(|e| {
-                        if e.is_symbol() && e.node.as_symbol().unwrap() == "_" {
-                            Ok(Type::Placeholder)
-                        } else {
-                            Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
-                        }
-                    }).collect::<Result<_, _>>()?;
-                    let ret_type = types.remove(types.len() - 1);
-                    let param_types = types;
-
-                    let imp = Implementation {
-                        func: func_name,
-                        params: param_types,
-                        ret: Box::new(ret_type)
-                    };
-                    implementations.push(imp);
-                }
-                println!("Implements {:?}", implementations);
-                Ok(Type::Implements(implementations))
-            } else {
-                panic!()
-            }
+            Ok(eval(node.clone(), env)?.into_type().unwrap())
         };
 
         let func_ty = Type::Method {
-            param_names: params.keys().cloned().collect(),
             params: params.values().map(|v| parse_param_type(v)).collect::<Result<_, _>>()?,
             ret: Box::new(ret_ty.into_type().map_err(|n| {
                 EvalError::TypeMismatch { expected: "Type".to_string(), got: n.ty(), span: n.tag }
             })?)
         };
-        Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop { env: Rc::clone(env), body: Box::new(block), ty: func_ty })))
+        Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
+            param_names: params.keys().cloned().collect(),
+            env: Rc::clone(env), body: Box::new(block), ty: func_ty
+        })))
     }));
     global_env.def("if".into(), Box::new(|mut args, env| {
         let cond = eval(args.next().unwrap(), env)?;
@@ -966,14 +1005,33 @@ fn main() {
             Box::new(ty.into_type().unwrap())
         )))
     }));
-    // global_env.def("imp".into(), Box::new(|mut args, env| {
-    //     //let funcs: Vec<_> = args.map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-    //     let funcs: Vec<_> = args.map(|a| a.into_symbol()).collect::<Result<_, _>>().unwrap();
+    global_env.def("imp".into(), Box::new(|mut args, env| {
+        let mut implementations = Vec::new();
+        for elem in args {
+            let elem = elem.node.as_list().unwrap();
+            let elem = elem.borrow();
 
-    //     Ok(Node::new_type(Default::default(), Type::Implements(
-    //         funcs
-    //     )))
-    // }));
+            let func_name = elem[0].node.as_symbol().unwrap().clone();
+            let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
+                if e.is_symbol() && e.node.as_symbol().unwrap().starts_with("_") {
+                    let placeholder_name = e.node.as_symbol().unwrap().split_at(1).1;
+                    Ok(Type::Placeholder(if placeholder_name.len() == 0 { None } else { Some(placeholder_name.into()) }))
+                } else {
+                    Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
+                }
+            }).collect::<Result<_, _>>()?;
+            let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
+
+            let imp = Implementation {
+                func: func_name,
+                params: param_types,
+                ret: Box::new(ret_type)
+            };
+            implementations.push(imp);
+        }
+        println!("Implements {:?}", implementations);
+        Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
+    }));
 
     let global_env_rc = Rc::new(RefCell::new(global_env));
     let result = eval(tree, &global_env_rc);

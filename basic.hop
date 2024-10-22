@@ -7,4 +7,7 @@ set Cat (struct [
 set Building (struct [
     height: Number
 ]);
-def lift [this: Dumbell, strength: Number] -> Number { print "oof"; print this.weight; 0 };
+def lift [this: Dumbell, strength: Number] -> Unknown { print "oof"; print this.weight; 0 };
+
+print (+ 1 2);
+print (+ "hi " "wow");

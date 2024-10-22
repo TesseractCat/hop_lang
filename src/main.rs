@@ -125,13 +125,14 @@ struct Implementation {
 #[derive(Debug, PartialEq, Clone, EnumAsInner)]
 enum Type {
     Placeholder(Option<SmolStr>),
+    Any,
+    Unknown,
     Type,
     Symbol,
     Bool,
     Number,
     String,
 
-    Untyped,
     UntypedList,
     UntypedTable,
     List(Box<Type>),
@@ -147,8 +148,12 @@ enum Type {
 impl Type {
     pub fn compatible(self: &Type, rhs: &Type, env: &Environment, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
         if self == rhs { return true; }
+        match rhs {
+            Self::Any | Self::Unknown => return true,
+            _ => ()
+        };
         match self {
-            Self::Untyped => true,
+            Self::Any | Self::Unknown => true,
             Self::Implements(implementations) => {
                 for imp in implementations {
                     if let Some(func) = env.get(&imp.func) {
@@ -446,6 +451,7 @@ fn parse_table(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
     let mut table: IndexMap<SmolStr, SpanNode> = IndexMap::new();
     let mut want_key = true;
     let mut key: SmolStr = SmolStr::default();
+    let start = lexer.span().start;
 
     let mut res: Vec<SpanNode> = Vec::new();
     while let Some(Ok(token)) = lexer.next() {
@@ -454,6 +460,9 @@ fn parse_table(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
                 Token::Symbol(str) => key = str.into(),
                 Token::Colon | Token::Comma => {
                     want_key = false;
+                },
+                Token::TableClose => {
+                    return Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
                 },
                 token => return Err(ParseError::ExpectedSymbol { got: token, span: lexer.span() })
             };
@@ -497,21 +506,22 @@ fn parse_table(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
                             lexer.span(), Reference::new(mem::take(&mut res))
                         ));
                     }
-                    return Ok(Node::new_table(lexer.span(), Reference::new(table)))
+                    return Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
                 },
                 token => return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
             };
         }
     }
-    Ok(Node::new_table(lexer.span(), Reference::new(table)))
+    Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
 }
 // (a 123 false)
 fn parse_list(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
     let mut res: Vec<SpanNode> = Vec::new();
+    let start = lexer.span().start;
 
     while let Some(token) = lexer.next() {
         match token.map_err(|_| ParseError::Generic(lexer.span()))? {
-            Token::ListClose => return Ok(Node::new_list(lexer.span(), Reference::new(res))),
+            Token::ListClose => return Ok(Node::new_list(start..lexer.span().end, Reference::new(res))),
 
             Token::ListOpen => res.push(parse_list(lexer)?),
             Token::BlockOpen => res.push(parse_block(lexer)?),
@@ -535,7 +545,7 @@ fn parse_list(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
             token => return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
         }
     }
-    Ok(Node::new_list(lexer.span(), Reference::new(res)))
+    Ok(Node::new_list(start..lexer.span().end, Reference::new(res)))
 }
 // A block is like a list but each semicolon-separated line gets it's own list
 // {
@@ -550,6 +560,7 @@ fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
     let mut res: Vec<SpanNode> = Vec::new();
     res.push(Node::new_symbol(lexer.span(), "do".into()));
     let mut list: Vec<SpanNode> = Vec::new();
+    let start = lexer.span().start;
 
     while let Some(token) = lexer.next() {
         match token.map_err(|_| ParseError::Generic(lexer.span()))? {
@@ -559,15 +570,11 @@ fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
                 } else {
                     res.push(Node::new_list(lexer.span(), Reference::new(list)));
                 }
-                return Ok(Node::new_list(lexer.span(), Reference::new(res)))
+                return Ok(Node::new_list(start..lexer.span().end, Reference::new(res)))
             },
             Token::Semicolon => {
                 let list = mem::take(&mut list);
-                if list.len() == 1 {
-                    res.push(list.into_iter().next().unwrap());
-                } else {
-                    res.push(Node::new_list(lexer.span(), Reference::new(list)));
-                }
+                res.push(Node::new_list(lexer.span(), Reference::new(list)));
             },
 
             Token::ListOpen => list.push(parse_list(lexer)?),
@@ -597,15 +604,30 @@ fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
     } else {
         res.push(Node::new_list(lexer.span(), Reference::new(list)));
     }
-    Ok(Node::new_list(lexer.span(), Reference::new(res)))
+    Ok(Node::new_list(start..lexer.span().end, Reference::new(res)))
 }
 
 #[derive(Default, Debug, PartialEq)]
 struct Environment {
     bindings: HashMap<SmolStr, SpanNode>,
-    up: Option<Rc<RefCell<Environment>>>
+    up: Option<Rc<RefCell<Environment>>>,
+    global: Option<Rc<RefCell<Environment>>>
 }
 impl Environment {
+    fn new_child(this: Rc<RefCell<Self>>) -> Self {
+        Environment {
+            up: Some(Rc::clone(&this)),
+            global: Some(
+                if this.borrow().global.is_some() {
+                    this.borrow().global.clone().unwrap()
+                } else {
+                    this
+                }
+            ),
+            ..Default::default()
+        }
+    }
+
     fn get(&self, name: &SmolStr) -> Option<SpanNode> {
         if let Some(binding) = self.bindings.get(name) {
             Some(binding.clone())
@@ -652,13 +674,40 @@ impl Environment {
             self.bindings.insert(name, value.clone());
         }
     }
-    fn def(&mut self, name: SmolStr, func: Box<Callback>) {
-        let func = Node::new_method(Default::default(), Reference::new(Method::Rust { callback: func, ty: Type::Untyped }));
+    fn def(&mut self, name: SmolStr, value: SpanNode) {
         if self.has(&name) {
-            self.get(&name).unwrap().into_list().unwrap().borrow_mut().push(func);
+            self.get(&name).unwrap().into_list().unwrap().borrow_mut().push(value);
         } else {
-            self.set(name.clone(), Node::new_list(Default::default(), Reference::new(vec![func])));
+            self.set(name.clone(), Node::new_list(Default::default(), Reference::new(vec![value])));
         }
+    }
+
+    fn global_get(&mut self, name: &SmolStr) -> Option<SpanNode> {
+        if let Some(ref mut global) = self.global {
+            global.borrow_mut().get(name)
+        } else {
+            self.get(name)
+        }
+    }
+    fn global_set(&mut self, name: SmolStr, value: SpanNode) {
+        if let Some(ref mut global) = self.global {
+            global.borrow_mut().set(name, value);
+        } else {
+            self.set(name, value);
+        }
+    }
+    fn global_def(&mut self, name: SmolStr, value: SpanNode) {
+        if let Some(ref mut global) = self.global {
+            global.borrow_mut().def(name, value);
+        } else {
+            self.def(name, value);
+        }
+    }
+
+    fn def_rust_func(&mut self, name: SmolStr, value: Box<Callback>) {
+        self.def(name, Node::new_method(Default::default(), Reference::new(
+            Method::Rust { callback: value, ty: Type::Unknown }
+        )))
     }
 }
 
@@ -689,6 +738,7 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
                     let method_param_tys = method_ty.0;
                     let method_ret_ty = method_ty.1;
                     let param_count = method_param_names.len();
+                    let body_tag = body.tag.clone();
 
                     if param_count != call_tys.len() { continue; }
 
@@ -708,10 +758,7 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
                     {
                         // Call method
                         // Create a new scope
-                        let mut new_env = Environment {
-                            up: Some(Rc::clone(&env)),
-                            ..Default::default()
-                        };
+                        let mut new_env = Environment::new_child(Rc::clone(env));
 
                         for (param, arg) in method_param_names.into_iter().zip(call_args.into_iter()) {
                             //println!("Setting function env {param} = {arg}");
@@ -719,11 +766,12 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
                         }
 
                         let new_env_rc = Rc::new(RefCell::new(new_env));
-                        let (res_ty, res) = eval(*body.clone(), &new_env_rc)?.with_type();
-                        return if res_ty == *method_ret_ty {
+                        let res = eval(*body.clone(), &new_env_rc)?;
+                        let res_ty = res.ty();
+                        return if method_ret_ty.compatible(&res_ty, &*env.borrow(), &mut Default::default()) {
                             Ok(res)
                         } else {
-                            Err(EvalError::TypeMismatch { expected: format!("{}", res_ty), got: *method_ret_ty, span: 0..1 })
+                            Err(EvalError::TypeMismatch { expected: format!("{}", res_ty), got: *method_ret_ty, span: body_tag })
                         };
                     }
                 },
@@ -834,48 +882,49 @@ fn main() {
 
     // Eval
     let mut global_env = Environment::default();
-    global_env.bindings.insert("Any".into(), Node::new_type(Default::default(), Type::Untyped));
+    global_env.bindings.insert("Any".into(), Node::new_type(Default::default(), Type::Any));
+    global_env.bindings.insert("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
     global_env.bindings.insert("Number".into(), Node::new_type(Default::default(), Type::Number));
     global_env.bindings.insert("Bool".into(), Node::new_type(Default::default(), Type::Bool));
     global_env.bindings.insert("String".into(), Node::new_type(Default::default(), Type::String));
     global_env.bindings.insert("Type".into(), Node::new_type(Default::default(), Type::Type));
     global_env.bindings.insert("Function".into(), Node::new_type(Default::default(), Type::Number));
-    global_env.def("_".into(), Box::new(|args, env| {
+    global_env.def_rust_func("_".into(), Box::new(|args, env| {
         let span = args.clone().next().unwrap().tag.clone();
         Ok(Node::new_list(
             span,
             Reference::new(args.map(|arg| eval(arg, env)).collect::<Result<Vec<_>, _>>()?)
         ))
     }));
-    global_env.def("+".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("+".into(), Box::new(|mut args, env| {
         let a = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a + b))
     }));
-    global_env.def("-".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("-".into(), Box::new(|mut args, env| {
         let a = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a - b))
     }));
-    global_env.def("lt".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("lt".into(), Box::new(|mut args, env| {
         let a = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a < b))
     }));
-    global_env.def("=".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("=".into(), Box::new(|mut args, env| {
         let a = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = eval(args.next().unwrap(), env)?.into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a == b))
     }));
-    global_env.def("loop".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("loop".into(), Box::new(|mut args, env| {
         let body = args.next().unwrap();
         loop {
             if let NodeValue::Bool(b) = eval(body.clone(), env)?.node {
@@ -884,12 +933,9 @@ fn main() {
         }
         Ok(Node::new_list(Default::default(), Reference::new(vec![])))
     }));
-    global_env.def("do".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("do".into(), Box::new(|mut args, env| {
         // Create a new scope
-        let new_env = Environment {
-            up: Some(Rc::clone(env)),
-            ..Default::default()
-        };
+        let new_env = Environment::new_child(Rc::clone(env));
         let new_env_rc = Rc::new(RefCell::new(new_env));
         let mut res = Node::new_list(Default::default(), Reference::new(Vec::new()));
 
@@ -898,15 +944,7 @@ fn main() {
         }
         Ok(res)
     }));
-    global_env.def("set".into(), Box::new(|mut args, env| {
-        let name = args.next().unwrap();
-        let value = eval(args.next().unwrap(), env)?;
-        if let NodeValue::Symbol(ref name) = name.node {
-            env.borrow_mut().set(name.clone(), value);
-        }
-        Ok(name)
-    }));
-    global_env.def("get".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("get".into(), Box::new(|mut args, env| {
         let (ty, var) = eval(args.next().unwrap(), env)?.with_type();
         let key = args.next().unwrap();
 
@@ -918,26 +956,53 @@ fn main() {
             panic!("Can only get from table/list objects, got: {var}")
         }
     }));
-    global_env.def("def".into(), Box::new(|mut args, env| {
-        let name_symbol = args.next().unwrap();
+    global_env.def_rust_func("set".into(), Box::new(|mut args, env| {
+        let name = args.next().unwrap();
         let value = eval(args.next().unwrap(), env)?;
-        if !value.is_method() {
-            return Err(EvalError::TypeMismatch { expected: "Method".to_string(), got: value.ty(), span: name_symbol.tag });
+        if let NodeValue::Symbol(ref name) = name.node {
+            env.borrow_mut().set(name.clone(), value);
         }
+        Ok(name)
+    }));
+    global_env.def_rust_func("global-set".into(), Box::new(|mut args, env| {
+        let name = args.next().unwrap();
+        let value = eval(args.next().unwrap(), env)?;
+        if let NodeValue::Symbol(ref name) = name.node {
+            env.borrow_mut().global_set(name.clone(), value);
+        }
+        Ok(name)
+    }));
+    global_env.def_rust_func("def".into(), Box::new(|mut args, env| {
+        let name_symbol = args.next().unwrap();
+
+        let mut list = vec![Node::new_symbol(Default::default(), "fn".into())];
+        list.extend(args);
+
+        let value = eval(Node::new_list(name_symbol.tag.clone(), Reference::new(list)), env)?;
+        assert!(value.is_method());
         if let NodeValue::Symbol(ref name) = name_symbol.node {
-            if env.borrow().has(name) {
-                env.borrow_mut().get(name).unwrap().into_list().unwrap().borrow_mut().push(value);
-            } else {
-                env.borrow_mut().set(name.clone(), Node::new_list(name_symbol.tag.clone(), Reference::new(vec![value])));
-            }
+            env.borrow_mut().global_def(name.clone(), value);
         }
         Ok(name_symbol)
     }));
-    global_env.def("call".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("local-def".into(), Box::new(|mut args, env| {
+        let name_symbol = args.next().unwrap();
+
+        let mut list = vec![Node::new_symbol(Default::default(), "fn".into())];
+        list.extend(args);
+
+        let value = eval(Node::new_list(name_symbol.tag.clone(), Reference::new(list)), env)?;
+        assert!(value.is_method());
+        if let NodeValue::Symbol(ref name) = name_symbol.node {
+            env.borrow_mut().def(name.clone(), value);
+        }
+        Ok(name_symbol)
+    }));
+    global_env.def_rust_func("call".into(), Box::new(|mut args, env| {
         let func_symbol = args.next().unwrap();
         Ok(eval_call(func_symbol.clone(), eval(func_symbol, env)?, args, env)?)
     }));
-    global_env.def("fn".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("fn".into(), Box::new(|mut args, env| {
         let params = args.next().unwrap(); // let params = eval(args.next().unwrap(), env)?;
         let arrow = args.next().unwrap();
         arrow.node.as_symbol().filter(|s| **s == "->").ok_or(EvalError::Generic(arrow.tag))?;
@@ -967,7 +1032,7 @@ fn main() {
             env: Rc::clone(env), body: Box::new(block), ty: func_ty
         })))
     }));
-    global_env.def("if".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("if".into(), Box::new(|mut args, env| {
         let cond = eval(args.next().unwrap(), env)?;
         let yes = args.next().unwrap();
         let else_symbol = args.next().unwrap();
@@ -980,13 +1045,13 @@ fn main() {
         }
     }));
     let out = Rc::new(RefCell::new(BufWriter::new(std::io::stdout())));
-    global_env.def("print".into(), Box::new(move |mut args, env| {
+    global_env.def_rust_func("print".into(), Box::new(move |mut args, env| {
         let value = eval(args.next().unwrap(), env)?;
         //writeln!(out.borrow_mut(), "{value}");
         println!("{value}");
         Ok(value)
     }));
-    global_env.def("struct".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("struct".into(), Box::new(|mut args, env| {
         let structure = eval(args.next().unwrap(), env)?;
         assert!(structure.is_table());
         // let structure: Result<IndexMap<_, _>, Box<dyn Error>> =
@@ -998,14 +1063,14 @@ fn main() {
             Box::new(structure)
         )))
     }));
-    global_env.def("List".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("List".into(), Box::new(|mut args, env| {
         let ty = eval(args.next().unwrap(), env)?;
 
         Ok(Node::new_type(Default::default(), Type::List(
             Box::new(ty.into_type().unwrap())
         )))
     }));
-    global_env.def("imp".into(), Box::new(|mut args, env| {
+    global_env.def_rust_func("imp".into(), Box::new(|mut args, env| {
         let mut implementations = Vec::new();
         for elem in args {
             let elem = elem.node.as_list().unwrap();

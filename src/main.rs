@@ -768,7 +768,7 @@ fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item
                         let new_env_rc = Rc::new(RefCell::new(new_env));
                         let res = eval(*body.clone(), &new_env_rc)?;
                         let res_ty = res.ty();
-                        return if method_ret_ty.compatible(&res_ty, &*env.borrow(), &mut Default::default()) {
+                        return if method_ret_ty.compatible(&res_ty, &*env.borrow(), &mut placeholder_matches) {
                             Ok(res)
                         } else {
                             Err(EvalError::TypeMismatch { expected: format!("{}", res_ty), got: *method_ret_ty, span: body_tag })

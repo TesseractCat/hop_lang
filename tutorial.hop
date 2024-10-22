@@ -1,0 +1,58 @@
+// Hoplang is Lisp-inspired but with a focus on imperative code and Rust-like syntax.
+// Like TypeScript, Hoplang is a statically-typed interpreted scripting language.
+//
+// The goal of Hoplang is to unify the freedom of Lisp, the type-safety of Rust,
+// and the speed of LuaJIT into an embeddable scripting language that's fun
+// to use and easy to learn.
+//
+// Roadmap:
+//  - TODO: Static typing :^)
+//  - TODO: JIT with cranelift
+
+// The basic elements of hoplang syntax are lists, tables, and blocks.
+print (_ 1 2 3); // list
+set table [hello: "world", foo: 12]; // table
+// Tables can be indexed using the . operator, which is syntax sugar:
+// x.y becomes (get x y)
+print table.hello;
+print {
+    // block
+    + 1 2;
+    print "imperative";
+
+    // Note that blocks are just syntax sugar for a `do` statement:
+    // { + x y; z } evaluates to (do (+ x y) z)
+    // Do statements evaluate to their last argument.
+};
+
+// Like in lisp, you call functions by placing them as the first element
+// of a list. I.e. (func x y z).
+//
+// But hoplang supports multiple dispatch, which means one function can have
+// any number of different implementations.
+//
+// Hoplang extends the idea of functions as behaviour to encompass multiple
+// paradigms. Like Rust traits, hoplang functions name a behaviour that
+// can be implemented.
+//
+// So for example, we can describe the behaviour of addition (+):
+//  def + [a: Number, b: Number] -> Number { ... }
+//  def + [a: String, b: String] -> String { ... }
+// or serialization:
+//  def ser [a: Foo] -> String { ... }
+//
+// Hoplang functions can be generic over behaviour. I.e.:
+//  def sort [list: (imp next _ -> (imp cmp _T _T))] -> (imp next _ -> _T) { ... }
+// This function accepts any type that has a `next` implementation. The `_` symbol
+// marks a placeholder that is filled with the provided type.
+// If a placeholder is named, like `_T`, all instances of the placeholder
+// in the function signature must be the same.
+
+// Let's create a struct
+// (set <name> <value>)
+set Dumbell (struct [
+    weight: Number
+]);
+
+// A struct can then be called to create an instance of it.
+set fiveKG (Dumbell [ weight: 5 ]);

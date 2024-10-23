@@ -1,10 +1,10 @@
-set Dumbell (struct [
+let Dumbell (struct [
     weight: Number
 ]);
-set Cat (struct [
+let Cat (struct [
     cuteness: Number
 ]);
-set Building (struct [
+let Building (struct [
     height: Number
 ]);
 def lift [this: Dumbell, strength: Number] -> Unknown { print "oof"; print this.weight; 0 };

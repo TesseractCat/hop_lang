@@ -11,7 +11,7 @@
 
 // The basic elements of hoplang syntax are lists, tables, and blocks.
 print (_ 1 2 3); // list
-set table [hello: "world", foo: 12]; // table
+let table [hello: "world", foo: 12]; // table
 // Tables can be indexed using the . operator, which is syntax sugar:
 // x.y becomes (get x y)
 print table.hello;
@@ -49,10 +49,10 @@ print {
 // in the function signature must be the same.
 
 // Let's create a struct
-// (set <name> <value>)
-set Dumbell (struct [
+// (let <name> <value>)
+let Dumbell (struct [
     weight: Number
 ]);
 
 // A struct can then be called to create an instance of it.
-set fiveKG (Dumbell [ weight: 5 ]);
+let fiveKG (Dumbell [ weight: 5 ]);

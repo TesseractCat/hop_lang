@@ -1,10 +1,10 @@
-set Dumbell (struct [
+let Dumbell (struct [
     weight: Number
 ]);
-set Cat (struct [
+let Cat (struct [
     cuteness: Number
 ]);
-set Building (struct [
+let Building (struct [
     height: Number
 ]);
 def lift [this: Dumbell, strength: Number] -> Number { print "oof"; print this.weight; 0 };
@@ -18,6 +18,11 @@ def test [] -> Unknown {
         lift b strength
     };
 };
+def test [x: Number] -> Number { x };
+if (lt (rand) 0.5) {
+    set test "nooo";
+}
+print test;
 test;
 def wowow [] -> (imp (lift _ Number -> Number)) {
     Cat [cuteness: 37]
@@ -28,7 +33,7 @@ def wowow [] -> (imp (lift _ Number -> Number)) {
 //    }
 //});
 //comptime Query (fn [type: Type] -> Type {
-//    set qt (struct []);
+//    let qt (struct []);
 //    global-def next (fn [this: qt] -> type {
 //
 //    });
@@ -44,13 +49,13 @@ def getval [this: Number] -> Number { this };
 def eq [a: Number, b: Number] -> Bool { = a b };
 def eqval [a: imp (getval _ -> Number), b: imp (getval _ -> Number)] -> Bool { eq (getval a) (getval b) };
 
-set foo Dumbell.([
+let foo Dumbell.([
     weight: 5
 ]);
-set bar Cat.([
+let bar Cat.([
     cuteness: 9001
 ]);
-set baz Building.([
+let baz Building.([
     height: 100
 ]);
 lift foo 2;

@@ -15,7 +15,7 @@ pub struct Implementation {
 }
 #[derive(Debug, PartialEq, Clone, EnumAsInner)]
 pub enum Type {
-    Type,
+    Type(Option<Box<Type>>),
     Placeholder(Option<SmolStr>),
     Any,
     Unknown,
@@ -38,7 +38,7 @@ pub enum Type {
     Struct(Box<SpanNode>)
 }
 impl Type {
-    pub fn compatible(self: &Type, rhs: &Type, env: &Environment, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
+    pub fn compatible(self: &Type, rhs: &Type, get_methods: &impl Fn(&str) -> Option<Vec<Type>>, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
         if self == rhs { return true; }
         match rhs {
             Self::Any | Self::Unknown => return true,
@@ -46,63 +46,52 @@ impl Type {
         };
         match self {
             Self::Any | Self::Unknown => true,
+            Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
             Self::Implements(implementations) => {
                 for imp in implementations {
-                    if let Some(func) = env.get(&imp.func) {
-                        if func.ty().is_function() {
-                            let list = func.with_type().1.into_list().unwrap();
-                            let list = list.borrow();
-                            let list = list.iter().map(|l| l.node.as_method().unwrap());
-
-                            let mut found_match = false;
-                            'outer: for method in list {
-                                let method = method.borrow();
-                                match &*method {
-                                    Method::Rust { ty, .. } | Method::Hop { ty, .. } => {
-                                        let method_ty = ty.as_method().unwrap();
-                                        //println!("CHECKING METHOD {method_ty:?}");
-                                        // First check arity and return type to quickly eliminate invalid matches
-                                        if imp.params.len() != method_ty.0.len() { continue; }
-                                        if !imp.ret.compatible(method_ty.1, env, placeholder_matches) { continue; }
-                                        // Then check all parameters in order
-                                        for (a, b) in imp.params.iter().zip(method_ty.0.iter()) {
-                                            // If we have a placeholder, fill it
-                                            let a = match *a {
-                                                // Empty placeholders automatically get filled with the matched type
-                                                Type::Placeholder(None) => rhs,
-                                                // Named placeholders get filled the first time they match
-                                                Type::Placeholder(Some(ref placeholder_name)) => {
-                                                    // If it's already filled, use that type
-                                                    if let Some(pt) = placeholder_matches.get(placeholder_name) {
-                                                        if pt != rhs {
-                                                            continue 'outer;
-                                                        } else {
-                                                            rhs
-                                                        }
-                                                    } else {
-                                                        placeholder_matches.insert(placeholder_name.clone(), rhs.clone());
-                                                        rhs
-                                                    }
-                                                },
-                                                _ => a
-                                            };
-                                            // println!("{a} vs. {b} ULTIMATE SHOWDOWN");
-                                            // println!("RESULT!!!! {}", a.compatible(b, env, placeholder_matches));
-                                            if !a.compatible(b, env, placeholder_matches) { continue 'outer; }
+                    let mut found_match = false;
+                    let methods = get_methods(imp.func.as_str());
+                    if let Some(methods) = methods {
+                        'outer: for ty in methods {
+                            let method_ty = ty.as_method().unwrap();
+                            //println!("CHECKING METHOD {method_ty:?}");
+                            // First check arity and return type to quickly eliminate invalid matches
+                            if imp.params.len() != method_ty.0.len() { continue; }
+                            if !imp.ret.compatible(method_ty.1, get_methods, placeholder_matches) { continue; }
+                            // Then check all parameters in order
+                            for (a, b) in imp.params.iter().zip(method_ty.0.iter()) {
+                                // If we have a placeholder, fill it
+                                let a = match *a {
+                                    // Empty placeholders automatically get filled with the matched type
+                                    Type::Placeholder(None) => rhs,
+                                    // Named placeholders get filled the first time they match
+                                    Type::Placeholder(Some(ref placeholder_name)) => {
+                                        // If it's already filled, use that type
+                                        if let Some(pt) = placeholder_matches.get(placeholder_name) {
+                                            if pt != rhs {
+                                                continue 'outer;
+                                            } else {
+                                                rhs
+                                            }
+                                        } else {
+                                            placeholder_matches.insert(placeholder_name.clone(), rhs.clone());
+                                            rhs
                                         }
-                                        // println!("FOUND MATCH!!!!");
-                                        found_match = true;
-                                        break 'outer;
-                                    }
-                                }
+                                    },
+                                    _ => a
+                                };
+                                // println!("{a} vs. {b} ULTIMATE SHOWDOWN");
+                                // println!("RESULT!!!! {}", a.compatible(b, env, placeholder_matches));
+                                if !a.compatible(b, get_methods, placeholder_matches) { continue 'outer; }
                             }
-                            if !found_match { return false; }
-                        } else {
-                            return false;
+                            // println!("FOUND MATCH!!!!");
+                            found_match = true;
+                            break 'outer;
                         }
                     } else {
                         return false;
                     }
+                    if !found_match { return false; }
                 }
                 true
             },
@@ -181,17 +170,20 @@ impl Debug for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Hop { ty, .. } | Self::Rust { ty, ..} => {
-                let ty = ty.as_method().unwrap();
-                write!(f, "method(")?;
-                let mut it = ty.0.iter().peekable();
-                while let Some(item) = it.next() {
-                    if it.peek().is_none() {
-                        write!(f, "{}", item)?;
-                    } else {
-                        write!(f, "{} ", item)?;
+                if let Some(ty) = ty.as_method() {
+                    write!(f, "method(")?;
+                    let mut it = ty.0.iter().peekable();
+                    while let Some(item) = it.next() {
+                        if it.peek().is_none() {
+                            write!(f, "{}", item)?;
+                        } else {
+                            write!(f, "{} ", item)?;
+                        }
                     }
+                    write!(f, ") -> {}", ty.1)
+                } else {
+                    write!(f, "method(?) -> ?")
                 }
-                write!(f, ") -> {}", ty.1)
             }
         }
     }
@@ -301,7 +293,11 @@ impl<T: Clone> Node<T> {
             NodeValue::Table(_) => Type::UntypedTable,
 
             NodeValue::Typed(ty, _) => ty.clone(),
-            NodeValue::Type(ty) => Type::Type,//Type::Type(Box::new(ty.clone())),
+            NodeValue::Type(ty) => Type::Type(Some(Box::new(ty.clone()))),
+            //NodeValue::Type(ty) => Type::Type,
+            NodeValue::Method(m) => match &*m.borrow() {
+                Method::Hop { ty, .. } | Method::Rust { ty, .. } => ty.clone()
+            },
             _ => unimplemented!("ty {self}")
         }
     }

@@ -34,7 +34,7 @@ impl EvalError {
 
 #[derive(Default, Debug, PartialEq)]
 pub struct Environment {
-    bindings: HashMap<SmolStr, SpanNode>,
+    pub bindings: HashMap<SmolStr, SpanNode>,
     up: Option<Rc<RefCell<Self>>>,
     global: Option<Rc<RefCell<Self>>>
 }
@@ -153,6 +153,15 @@ impl Environment {
 }
 
 pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item = SpanNode>, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
+    let get_methods = |func: &str| -> Option<Vec<Type>> {
+        let (ty, methods) = env.borrow().get(&func.into())?.with_type();
+        if ty.is_function() {
+            Some(methods.as_list().unwrap().borrow().iter().map(|n| n.ty()).collect())
+        } else {
+            None
+        }
+    };
+
     if func.ty().is_function() {
         let methods = func.with_type().1.into_list().unwrap();
         let methods: Vec<Reference<Method>> = methods.borrow().iter().cloned().map(|m| m.into_method().unwrap()).collect();
@@ -190,7 +199,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
                     if method_param_tys.iter().zip(&call_tys)
                         .filter(|&(a, b)| {
-                            if a.compatible(b, &*env.borrow(), &mut placeholder_matches) {
+                            if a.compatible(b, &get_methods, &mut placeholder_matches) {
                                 true
                             } else {
                                 //println!("    - {a} not compatible with {b}");
@@ -210,7 +219,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                         let new_env_rc = Rc::new(RefCell::new(new_env));
                         let res = eval(*body.clone(), &new_env_rc)?;
                         let res_ty = res.ty();
-                        return if method_ret_ty.compatible(&res_ty, &*env.borrow(), &mut placeholder_matches) {
+                        return if method_ret_ty.compatible(&res_ty, &get_methods, &mut placeholder_matches) {
                             Ok(res)
                         } else {
                             Err(EvalError::TypeMismatch { expected: format!("{}", method_ret_ty), got: res_ty, span: body_tag })
@@ -230,7 +239,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
                     if method_param_tys.iter().zip(&call_tys)
                         .filter(|&(a, b)| {
-                            if a.compatible(b, &*env.borrow(), &mut placeholder_matches) {
+                            if a.compatible(b, &get_methods, &mut placeholder_matches) {
                                 true
                             } else {
                                 //println!("    - {a} not compatible with {b}");

@@ -121,6 +121,45 @@ impl TypeEnvironment {
     }
 }
 
+pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterator<Item=Type>, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError>
+{
+    let env = env.borrow();
+    let call_tys: Vec<_> = args.collect();
+    if let Some(methods) = env.functions.get(func) {
+        let get_methods = |func: &str| -> Option<Vec<Type>> {
+            Some(env.functions.get(&SmolStr::from(func))?.clone())
+        };
+
+        let is_macro = methods.first().map(|m| matches!(m, Type::Unknown)).unwrap_or_default();
+
+        if is_macro {
+            panic!("Encountered macro {func_symbol}. Macros must be implemented earlier in the typecheck process");
+        }
+    
+        for method in methods {
+            let method_ty = method.as_method().unwrap();
+            let method_param_tys = method_ty.0;
+            let method_ret_ty = method_ty.1;
+            let param_count = method_param_tys.len();
+    
+            let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
+            if method_param_tys.iter().zip(&call_tys)
+                .filter(|&(a, b)| {
+                    if a.compatible(b, &get_methods, &mut placeholder_matches) {
+                        true
+                    } else {
+                        println!("    - {a} not compatible with {b}");
+                        false
+                    }
+                }).count() == param_count
+            {
+                return Ok(*method_ret_ty.clone());
+            }
+        }
+    }
+    Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
+}
+
 fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError> {
     match &node.node {
         NodeValue::Bool(_) => Ok(Type::Bool),
@@ -129,6 +168,8 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
         NodeValue::Symbol(name) => {
             Ok(ty_env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag.clone() })?.clone())
         },
+        NodeValue::Typed(ty, _) => Ok(ty.clone()),
+        NodeValue::Type(ty) => Ok(Type::Type(Some(Box::new(ty.clone())))),
         NodeValue::List(list) => {
             let list = list.borrow();
             if list.len() == 0 { return Ok(Type::UntypedList); }
@@ -171,7 +212,7 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
                     // Ok(Type::Type(Box::new(
                     //     Type::Struct(Box::new(table.clone()))
                     // )))
-                    Ok(Type::Type)
+                    Ok(Type::Type(None))
                 },
                 Some("def") => {
                     let func = list.next().unwrap();
@@ -194,21 +235,30 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
                     Ok(Type::UntypedList)
                 },
                 Some("print") => Ok(Type::Unknown),
+                Some("call") => {
+                    unimplemented!()
+                },
                 Some(func) => {
-                    if ty_env.borrow().functions.contains_key(func) {
+                    typecheck_call(first, func, list.map(|e| typecheck(e, ty_env)).collect::<Result<Vec<_>,_>>()?.into_iter(), ty_env)
+                    /*if ty_env.borrow().functions.contains_key(func) {
                         Ok(*ty_env.borrow().functions[func][0].as_method().unwrap().1.clone())
                     } else {
                         //todo!("{func}")
                         Ok(Type::UntypedList)
-                    }
+                    }*/
                 },
                 _ => {
-                    //let first = typecheck(first, env)?;
-                    Ok(Type::UntypedList)
+                    let first = typecheck(first, ty_env)?;
+                    if let Type::Type(Some(ty)) = first {
+                        Ok(*ty.clone())
+                    } else {
+                        Ok(Type::UntypedList)
+                    }
                 }
             }
         },
-        _ => todo!()
+        NodeValue::Table(_) => Ok(Type::UntypedTable),
+        _ => todo!("{node}")
     }
 }
 
@@ -283,7 +333,7 @@ fn main() {
     // Eval
     let mut global_env = Environment::new();
     global_env.global_set("Any".into(), Node::new_type(Default::default(), Type::Any));
-    global_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type));
+    global_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type(None)));
     global_env.global_set("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
     global_env.global_set("Number".into(), Node::new_type(Default::default(), Type::Number));
     global_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
@@ -536,7 +586,18 @@ fn main() {
     println!("Tree: {tree}");
 
     // Typecheck pass
-    let type_env = TypeEnvironment::new();
+    let mut type_env = TypeEnvironment::new();
+    //type_env.set("String".into(), Type::String, false);
+    for (k, v) in global_env_rc.borrow().bindings.iter() {
+        println!("SETTING TE {k} = {v} i.e. {}", v.ty());
+        type_env.set(k.clone(), v.ty(), false);
+        if v.ty().is_function() {
+            for method in v.as_typed().unwrap().1.as_list().unwrap().borrow().iter() {
+                println!(" - {method}");
+                type_env.def(k.clone(), method.ty());
+            }
+        }
+    }
     let type_env_rc = Rc::new(RefCell::new(type_env));
     if let Err(e) = typecheck(&tree, &type_env_rc) {
         let diagnostic = Diagnostic::error()

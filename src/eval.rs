@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, mem, rc::Rc};
 
+use indexmap::IndexMap;
 use logos::Span;
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -38,6 +39,12 @@ pub struct Environment {
     global: Option<Rc<RefCell<Self>>>
 }
 impl Environment {
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+
     pub fn new_child(this: Rc<RefCell<Self>>) -> Self {
         Self {
             up: Some(Rc::clone(&this)),
@@ -256,9 +263,9 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
         NodeValue::Symbol(name) => {
             Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag })?.clone())
         },
-        NodeValue::List(list) => {
+        NodeValue::List(ref list) => {
             if list.borrow().len() == 0 {
-                Ok(Node::new_list(node.tag, list))
+                Ok(node)
             } else {
                 let list = list.borrow();
                 let func_symbol = list.first().cloned().unwrap();
@@ -267,15 +274,15 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
                 eval_call(func_symbol, func, args, env)
             }
         },
-        NodeValue::Table(table) => {
+        NodeValue::Table(ref table) => {
+            let mut new_table: IndexMap<SmolStr, SpanNode> = IndexMap::new();
             {
-                let mut table = table.borrow_mut();
-                table.values_mut().map(|val| {
-                    let _ = mem::replace(val, eval(val.clone(), env)?);
-                    Ok::<_, EvalError>(())
-                }).collect::<Result<(), _>>()?;
+                let table = table.borrow();
+                for (k, v) in table.iter() {
+                    new_table.insert(k.clone(), eval(v.clone(), env)?);
+                }
             }
-            Ok(Node::new_table(node.tag, table))
+            Ok(Node::new_table(node.tag, Reference::new(new_table)))
         },
         _ => todo!("{node}")
     }

@@ -7,7 +7,32 @@ let Cat (struct [
 let Building (struct [
     height: Number
 ]);
-def lift [this: Dumbell, strength: Number] -> Unknown { print "oof"; print this.weight; 0 };
+//def lift [this: Dumbell, strength: Number] -> Unknown { print "oof"; print this.weight; 0 };
+
+static {
+    print "memowing";
+
+    let stupid (struct [
+        holds: String
+    ]);
+    def Bag [holdType: Type] -> Type {
+        stupid
+        //struct [
+        //    holds: holdType
+        //]
+    };
+};
+//def ident [x: static Number] -> (static Number) { x };
+//def ident [x: static String] -> (static String) { x };
+//def ident [x: static String] -> (static Number) { 69 };
+//let y 5;
+//set y (ident 5);
+//print y;
+print (refeq (static (Bag String)) (Bag String));
+def test [x: static (Bag String)] -> (static Number) { print x; 420 };
+test (Bag String).([holds: "Meow"]);
+//print (Bag String);
+//print (refeq (Bag Number) (static (Bag String)));
 
 print (+ 1 2);
 print (+ "hi " "wow");

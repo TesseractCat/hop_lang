@@ -12,41 +12,26 @@ use ast::{Implementation, Method, Node, NodeValue, Reference, SpanNode, Type};
 mod eval;
 use eval::{eval, eval_call};
 
-#[derive(Error, Debug)]
-pub enum TypeCheckError {
-    #[error("type mismatch: expected type {expected} got {got}")]
-    TypeMismatch { expected: String, got: Type, span: Span },
-    #[error("could not find method match")]
-    NoMethodMatches { span: Span },
-    #[error("attempted to call non-func as func")]
-    CalledNonFunc { span: Span },
-    #[error("attempted to dereference undefined variable")]
-    UndefinedVar { span: Span },
-    #[error("error")]
-    Generic(Span)
-}
-impl TypeCheckError {
-    pub fn span(&self) -> Span {
-        match self {
-            Self::TypeMismatch { span, .. } |
-            Self::NoMethodMatches { span, .. } |
-            Self::CalledNonFunc { span, .. } |
-            Self::UndefinedVar { span, .. } |
-            Self::Generic(span) => span.clone()
-        }
-    }
-}
-
 #[derive(Default, Debug, PartialEq)]
 pub struct TypeEnvironment {
+    static_env: Rc<RefCell<Environment>>,
     bindings: HashMap<SmolStr, Type>,
     functions: HashMap<SmolStr, Vec<Type>>,
     up: Option<Rc<RefCell<Self>>>,
     global: Option<Rc<RefCell<Self>>>
 }
 impl TypeEnvironment {
-    pub fn new_child(this: Rc<RefCell<Self>>) -> Self {
+    pub fn new() -> Self {
         Self {
+            static_env: Rc::new(RefCell::new(Environment::new())),
+            ..Default::default()
+        }
+    }
+
+    pub fn new_child(this: Rc<RefCell<Self>>) -> Self {
+        let child_static_env = Environment::new_child(this.borrow().static_env.clone());
+        Self {
+            static_env: Rc::new(RefCell::new(child_static_env)),
             up: Some(Rc::clone(&this)),
             global: Some(
                 if this.borrow().global.is_some() {
@@ -136,13 +121,13 @@ impl TypeEnvironment {
     }
 }
 
-fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, TypeCheckError> {
+fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError> {
     match &node.node {
         NodeValue::Bool(_) => Ok(Type::Bool),
         NodeValue::Number(_) => Ok(Type::Number),
         NodeValue::String(_) => Ok(Type::String),
         NodeValue::Symbol(name) => {
-            Ok(env.borrow_mut().get(&name).ok_or(TypeCheckError::UndefinedVar { span: node.tag.clone() })?.clone())
+            Ok(ty_env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag.clone() })?.clone())
         },
         NodeValue::List(list) => {
             let list = list.borrow();
@@ -155,42 +140,66 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                 Some("do") => {
                     let mut last = Type::UntypedList;
                     while let Some(elem) = list.next() {
-                        last = typecheck(elem, env)?;
+                        last = typecheck(elem, ty_env)?;
                     }
                     Ok(last)
                 },
-                Some("set") => {
+                Some("let") => {
                     let symbol = list.next().unwrap().node.as_symbol().unwrap();
                     let val = list.next().unwrap();
-                    env.borrow_mut().set(symbol.clone(), typecheck(val, env)?, false);
+                    let val_ty = typecheck(val, ty_env)?;
+                    ty_env.borrow_mut().set(symbol.clone(), val_ty, true);
                     Ok(Type::UntypedList)
+                },
+                Some("set") => {
+                    let symbol_node = list.next().unwrap();
+                    let symbol = symbol_node.node.as_symbol().unwrap();
+                    let val = list.next().unwrap();
+                    if let Some(to_ty) = ty_env.borrow().get(symbol) {
+                        let from_ty = typecheck(val, ty_env)?;
+                        if from_ty != to_ty {
+                            Err(EvalError::TypeMismatch { expected: format!("{}", to_ty), got: from_ty, span: val.tag.clone() })
+                        } else {
+                            Ok(Type::UntypedList)
+                        }
+                    } else {
+                        Err(EvalError::UndefinedVar { span: symbol_node.tag.clone() })
+                    }
                 },
                 Some("struct") => {
                     let table = list.next().unwrap();
-                    Ok(Type::Type(Box::new(
-                        Type::Struct(Box::new(table.clone()))
-                    )))
+                    // Ok(Type::Type(Box::new(
+                    //     Type::Struct(Box::new(table.clone()))
+                    // )))
+                    Ok(Type::Type)
                 },
                 Some("def") => {
                     let func = list.next().unwrap();
                     let params = list.next().unwrap();
                     let arrow = list.next().unwrap();
-                    let ret_ty = list.next().unwrap();
+                    let ret = list.next().unwrap().clone();//eval(list.next().unwrap().clone(), &ty_env.borrow().static_env)?;
 
-                    env.borrow_mut().functions.insert(
-                        func.as_symbol().unwrap().clone(),
-                        vec![
-                            Type::Method { params: vec![], ret: Box::new(Type::UntypedList) }
-                        ]
-                    );
+                    let param_tys: Vec<Type> = params.as_table().unwrap().borrow().values().map(|v| v.as_type().unwrap().clone()).collect();
+                    let ret_ty = ret.into_type().unwrap();
+
+                    let func_name = func.as_symbol().unwrap();
+                    let method_ty = Type::Method { params: param_tys, ret: Box::new(ret_ty) };
+
+                    if ty_env.borrow().functions.contains_key(func_name) {
+                        ty_env.borrow_mut().functions.get_mut(func_name).unwrap().push(method_ty);
+                    } else {
+                        ty_env.borrow_mut().functions.insert(func_name.clone(),vec![method_ty]);
+                    }
 
                     Ok(Type::UntypedList)
                 },
+                Some("print") => Ok(Type::Unknown),
                 Some(func) => {
-                    if env.borrow().functions.contains_key(func) {
-                        Ok(*env.borrow().functions[func][0].as_method().unwrap().1.clone())
+                    if ty_env.borrow().functions.contains_key(func) {
+                        Ok(*ty_env.borrow().functions[func][0].as_method().unwrap().1.clone())
                     } else {
-                        todo!()
+                        //todo!("{func}")
+                        Ok(Type::UntypedList)
                     }
                 },
                 _ => {
@@ -200,6 +209,48 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
             }
         },
         _ => todo!()
+    }
+}
+
+pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
+    match node.node {
+        NodeValue::Bool(_)
+            | NodeValue::Number(_)
+            | NodeValue::String(_)
+            | NodeValue::Symbol(_)
+            | NodeValue::Type(_)
+            | NodeValue::Typed(_, _) => Ok(node),
+        NodeValue::List(ref list) => {
+            if list.borrow().len() == 0 {
+                Ok(node)
+            } else {
+                let mut list = list.borrow_mut();
+                let func_symbol = list.first().cloned().unwrap();
+                let mut list_iter = list.iter_mut();
+                if let Some(func_symbol) = func_symbol.as_symbol() {
+                    if func_symbol.as_str() == "static" {
+                        let val = list_iter.nth(1).unwrap();
+                        return eval(val.clone(), env);
+                    }
+                }
+                for elem in list_iter {
+                    let _ = mem::replace(elem, eval_static(elem.clone(), env)?);
+                }
+                drop(list);
+                Ok(node)
+            }
+        },
+        NodeValue::Table(ref table) => {
+            {
+                let mut table = table.borrow_mut();
+                table.values_mut().map(|val| {
+                    let _ = mem::replace(val, eval_static(val.clone(), env)?);
+                    Ok::<_, EvalError>(())
+                }).collect::<Result<(), _>>()?;
+            }
+            Ok(node)
+        },
+        _ => todo!("{node}")
     }
 }
 
@@ -227,24 +278,12 @@ fn main() {
             return;
         }
     };
-    println!("Tree: {}", tree);
-
-    /*let type_env = TypeEnvironment::default();
-    let type_env_rc = Rc::new(RefCell::new(type_env));
-    if let Err(e) = typecheck(&tree, &type_env_rc) {
-        let diagnostic = Diagnostic::error()
-            .with_labels(vec![
-                Label::primary(file, e.span())
-            ])
-            .with_message(format!("typecheck: {e}"));
-
-        let _ = codespan_reporting::term::emit(&mut writer.lock(), &config, &files, &diagnostic);
-        return;
-    }*/
+    println!("Tree: {tree}");
 
     // Eval
-    let mut global_env = Environment::default();
+    let mut global_env = Environment::new();
     global_env.global_set("Any".into(), Node::new_type(Default::default(), Type::Any));
+    global_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type));
     global_env.global_set("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
     global_env.global_set("Number".into(), Node::new_type(Default::default(), Type::Number));
     global_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
@@ -292,6 +331,11 @@ fn main() {
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a == b))
     }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
+    global_env.def_rust_method("refeq".into(), Box::new(|mut args, env| {
+        let a = eval(args.next().unwrap(), env)?;
+        let b = eval(args.next().unwrap(), env)?;
+        Ok(Node::new_bool(Default::default(), a == b))
+    }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
     global_env.def_rust_macro("loop".into(), Box::new(|mut args, env| {
         let body = args.next().unwrap();
         loop {
@@ -475,6 +519,37 @@ fn main() {
     }));
 
     let global_env_rc = Rc::new(RefCell::new(global_env));
+    // Static pass
+    let tree = match eval_static(tree, &global_env_rc) {
+        Ok(t) => t,
+        Err(e) => {
+            let diagnostic = Diagnostic::error()
+                .with_labels(vec![
+                    Label::primary(file, e.span())
+                ])
+                .with_message(format!("static: {e}"));
+
+            let _ = codespan_reporting::term::emit(&mut writer.lock(), &config, &files, &diagnostic);
+            return;
+        }
+    };
+    println!("Tree: {tree}");
+
+    // Typecheck pass
+    let type_env = TypeEnvironment::new();
+    let type_env_rc = Rc::new(RefCell::new(type_env));
+    if let Err(e) = typecheck(&tree, &type_env_rc) {
+        let diagnostic = Diagnostic::error()
+            .with_labels(vec![
+                Label::primary(file, e.span())
+            ])
+            .with_message(format!("typecheck: {e}"));
+
+        let _ = codespan_reporting::term::emit(&mut writer.lock(), &config, &files, &diagnostic);
+        return;
+    }
+
+    // Main pass
     let result = eval(tree, &global_env_rc);
 
     match result {

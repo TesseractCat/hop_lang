@@ -15,7 +15,7 @@ pub struct Implementation {
 }
 #[derive(Debug, PartialEq, Clone, EnumAsInner)]
 pub enum Type {
-    Type(Box<Type>),
+    Type,
     Placeholder(Option<SmolStr>),
     Any,
     Unknown,
@@ -301,7 +301,7 @@ impl<T: Clone> Node<T> {
             NodeValue::Table(_) => Type::UntypedTable,
 
             NodeValue::Typed(ty, _) => ty.clone(),
-            NodeValue::Type(ty) => Type::Type(Box::new(ty.clone())),
+            NodeValue::Type(ty) => Type::Type,//Type::Type(Box::new(ty.clone())),
             _ => unimplemented!("ty {self}")
         }
     }

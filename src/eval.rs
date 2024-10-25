@@ -9,8 +9,10 @@ use crate::ast::{Callback, Method, Node, NodeValue, Reference, SpanNode, Type};
 
 #[derive(Error, Debug)]
 pub enum EvalError {
-    #[error("type mismatch: expected type {expected} got {got}")]
+    #[error("type mismatch: expected type `{expected}` got `{got}`")]
     TypeMismatch { expected: String, got: Type, span: Span },
+    #[error("got unexpected field `{got}` when creating struct instance")]
+    UnexpectedField { got: String, span: Span },
     #[error("could not find method match")]
     NoMethodMatches { span: Span },
     #[error("attempted to call non-func as func")]
@@ -24,6 +26,7 @@ impl EvalError {
     pub fn span(&self) -> Span {
         match self {
             Self::TypeMismatch { span, .. } |
+            Self::UnexpectedField { span, .. } |
             Self::NoMethodMatches { span, .. } |
             Self::CalledNonFunc { span, .. } |
             Self::UndefinedVar { span, .. } |
@@ -260,8 +263,39 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         return Err(EvalError::NoMethodMatches { span: func_symbol.tag });
     } else if let NodeValue::Type(ty) = func.node {
         // Create type instance
-        let val = eval(args.next().unwrap(), env)?;
-        Ok(Node::new_typed(func.tag, ty, val))
+        match ty {
+            Type::Struct(_) => {
+                let val = eval(args.next().unwrap(), env)?;
+                // FIXME: Check that fields are correct
+                Ok(Node::new_typed(func.tag, ty, val))
+            },
+            Type::Enum(ref variants) => {
+                let variants = variants.as_table().unwrap().borrow();
+                let enum_tag = args.next().unwrap().into_symbol().unwrap();
+                let variant = variants.get(&enum_tag).unwrap().as_type().unwrap();
+                let value = args.next().unwrap_or_else(|| todo!());
+
+                let create_variant_list = SpanNode::new_list(Default::default(), Reference::new(
+                    vec![Node::new_type(Default::default(), variant.clone()), value.clone()]
+                ));
+                let got = eval(create_variant_list, env)?;
+                let got_ty = got.ty();
+                let expected_ty = variant;
+                if got_ty != *expected_ty {
+                    return Err(EvalError::TypeMismatch { expected: format!("{expected_ty}"), got: got_ty, span: func.tag })
+                }
+                Ok(Node::new_typed(func.tag.clone(), ty.clone(),
+                    Node::new_table(func.tag, Reference::new(IndexMap::from([
+                        ("tag".into(), Node::new_type(Default::default(), variant.clone())),
+                        ("value".into(), got),
+                    ])))
+                ))
+            },
+            Type::String => {
+                Ok(args.next().unwrap())
+            }
+            _ => todo!()
+        }
     } else {
         return Err(EvalError::CalledNonFunc { span: func_symbol.tag });
     }

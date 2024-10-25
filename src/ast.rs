@@ -17,6 +17,7 @@ pub struct Implementation {
 pub enum Type {
     Type(Option<Box<Type>>),
     Placeholder(Option<SmolStr>),
+    Unit,
     Any,
     Unknown,
     Symbol,
@@ -35,7 +36,8 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Type>
     },
-    Struct(Box<SpanNode>)
+    Struct(Box<SpanNode>), // Table of field: Type
+    Enum(Box<SpanNode>) // Table of Tag: Type
 }
 impl Type {
     pub fn compatible(self: &Type, rhs: &Type, get_methods: &impl Fn(&str) -> Option<Vec<Type>>, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
@@ -47,6 +49,9 @@ impl Type {
         match self {
             Self::Any | Self::Unknown => true,
             Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
+            Self::Implements(implementations) if matches!(rhs, Self::Implements(_)) => {
+                todo!("compatible between imp types")
+            },
             Self::Implements(implementations) => {
                 for imp in implementations {
                     let mut found_match = false;

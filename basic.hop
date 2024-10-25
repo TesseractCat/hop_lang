@@ -8,34 +8,29 @@ static {
     global-set Building (struct [
         height: Number
     ]);
+    
+    let stupid (struct [
+        value: String
+    ]);
+    def Option [type: Type] -> Type {
+        enum [
+            Some: type,
+            None: Unit
+        ]
+    };
 };
 def lift [this: static Dumbell, strength: static Number] -> (static Unknown) { print "oof"; print this.weight; 0 };
 let foo ((static Dumbell) [weight: 5]);
 print (lift foo 6);
 
-static {
-    print "memowing";
+def test [x: static (Option String)] -> (static Number) { print x; 420 };
+def test [x: static Number] -> (static Number) { print x; x };
+print ((static (Option String)) Some "Meow");
+test 420;
 
-    let stupid (struct [
-        holds: String
-    ]);
-    def Bag [holdType: Type] -> Type {
-        stupid
-        //struct [
-        //    holds: holdType
-        //]
-    };
-};
-def ident [x: static String] -> (static String) { x };
-def ident [x: static Number] -> (static Number) { x };
-let y 5;
-set y (ident 5);
+//def ident [x: static String] -> (static String) { x };
+//def ident [x: static Number] -> (static Number) { x };
+//def meow [] -> (static (imp (ident _ -> String))) { "frog" };
+//let y "huh";
+//set y (meow);
 //print y;
-print (refeq (static (Bag String)) (Bag String));
-def test [x: static (Bag String)] -> (static Number) { print x; 420 };
-test ((static (Bag String)) [holds: "Meow"]);
-//print (Bag String);
-//print (refeq (Bag Number) (static (Bag String)));
-
-print (+ 1 2);
-print (+ "hi " "wow");

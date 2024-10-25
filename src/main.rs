@@ -148,7 +148,7 @@ pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterato
                     if a.compatible(b, &get_methods, &mut placeholder_matches) {
                         true
                     } else {
-                        println!("    - {a} not compatible with {b}");
+                        // println!("    - {a} not compatible with {b}");
                         false
                     }
                 }).count() == param_count
@@ -160,13 +160,16 @@ pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterato
     Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
 }
 
-fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError> {
+fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError> {
+    let get_methods = |func: &str| -> Option<Vec<Type>> {
+        Some(env.borrow().functions.get(&SmolStr::from(func))?.clone())
+    };
     match &node.node {
         NodeValue::Bool(_) => Ok(Type::Bool),
         NodeValue::Number(_) => Ok(Type::Number),
         NodeValue::String(_) => Ok(Type::String),
         NodeValue::Symbol(name) => {
-            Ok(ty_env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag.clone() })?.clone())
+            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag.clone() })?.clone())
         },
         NodeValue::Typed(ty, _) => Ok(ty.clone()),
         NodeValue::Type(ty) => Ok(Type::Type(Some(Box::new(ty.clone())))),
@@ -181,23 +184,23 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
                 Some("do") => {
                     let mut last = Type::UntypedList;
                     while let Some(elem) = list.next() {
-                        last = typecheck(elem, ty_env)?;
+                        last = typecheck(elem, env)?;
                     }
                     Ok(last)
                 },
                 Some("let") => {
                     let symbol = list.next().unwrap().node.as_symbol().unwrap();
                     let val = list.next().unwrap();
-                    let val_ty = typecheck(val, ty_env)?;
-                    ty_env.borrow_mut().set(symbol.clone(), val_ty, true);
+                    let val_ty = typecheck(val, env)?;
+                    env.borrow_mut().set(symbol.clone(), val_ty, true);
                     Ok(Type::UntypedList)
                 },
                 Some("set") => {
                     let symbol_node = list.next().unwrap();
                     let symbol = symbol_node.node.as_symbol().unwrap();
                     let val = list.next().unwrap();
-                    if let Some(to_ty) = ty_env.borrow().get(symbol) {
-                        let from_ty = typecheck(val, ty_env)?;
+                    if let Some(to_ty) = env.borrow().get(symbol) {
+                        let from_ty = typecheck(val, env)?;
                         if from_ty != to_ty {
                             Err(EvalError::TypeMismatch { expected: format!("{}", to_ty), got: from_ty, span: val.tag.clone() })
                         } else {
@@ -220,16 +223,31 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
                     let arrow = list.next().unwrap();
                     let ret = list.next().unwrap().clone();//eval(list.next().unwrap().clone(), &ty_env.borrow().static_env)?;
 
+                    let param_names: Vec<SmolStr> = params.as_table().unwrap().borrow().keys().cloned().collect();
                     let param_tys: Vec<Type> = params.as_table().unwrap().borrow().values().map(|v| v.as_type().unwrap().clone()).collect();
                     let ret_ty = ret.into_type().unwrap();
+
+                    // Recurse typecheck function body
+                    let mut new_env = TypeEnvironment::new_child(Rc::clone(env));
+                    for (param_name, param_ty) in param_names.iter().zip(param_tys.iter()) {
+                        //println!("Setting function env {param} = {arg}");
+                        new_env.set(param_name.clone(), param_ty.clone(), true);
+                    }
+                    let new_env_rc = Rc::new(RefCell::new(new_env));
+
+                    let body = list.next().unwrap();
+                    let body_ty = typecheck(body, &new_env_rc)?;
+                    if !ret_ty.compatible(&body_ty, &get_methods, &mut Default::default()) {
+                        return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
+                    }
 
                     let func_name = func.as_symbol().unwrap();
                     let method_ty = Type::Method { params: param_tys, ret: Box::new(ret_ty) };
 
-                    if ty_env.borrow().functions.contains_key(func_name) {
-                        ty_env.borrow_mut().functions.get_mut(func_name).unwrap().push(method_ty);
+                    if env.borrow().functions.contains_key(func_name) {
+                        env.borrow_mut().functions.get_mut(func_name).unwrap().push(method_ty);
                     } else {
-                        ty_env.borrow_mut().functions.insert(func_name.clone(),vec![method_ty]);
+                        env.borrow_mut().functions.insert(func_name.clone(),vec![method_ty]);
                     }
 
                     Ok(Type::UntypedList)
@@ -239,20 +257,52 @@ fn typecheck(node: &SpanNode, ty_env: &Rc<RefCell<TypeEnvironment>>) -> Result<T
                     unimplemented!()
                 },
                 Some(func) => {
-                    typecheck_call(first, func, list.map(|e| typecheck(e, ty_env)).collect::<Result<Vec<_>,_>>()?.into_iter(), ty_env)
-                    /*if ty_env.borrow().functions.contains_key(func) {
-                        Ok(*ty_env.borrow().functions[func][0].as_method().unwrap().1.clone())
-                    } else {
-                        //todo!("{func}")
-                        Ok(Type::UntypedList)
-                    }*/
+                    typecheck_call(first, func, list.map(|e| typecheck(e, env)).collect::<Result<Vec<_>,_>>()?.into_iter(), env)
                 },
                 _ => {
-                    let first = typecheck(first, ty_env)?;
+                    let first_tag = first.tag.clone();
+                    let first = typecheck(first, env)?;
                     if let Type::Type(Some(ty)) = first {
-                        Ok(*ty.clone())
+                        match &*ty {
+                            Type::Struct(fields) => {
+                                let fields = fields.as_table().unwrap().borrow();
+                                let table = list.next().unwrap().as_table().unwrap();
+                                for (k, v) in table.borrow().iter() {
+                                    let v_ty = typecheck(v, env)?;
+
+                                    if let Some(expected_ty) = fields.get(k) {
+                                        let expected_ty = expected_ty.as_type().unwrap();
+                                        if &v_ty != expected_ty {
+                                            return Err(EvalError::TypeMismatch { expected: format!("{}", expected_ty), got: v_ty, span: v.tag.clone() });
+                                        }
+                                    } else {
+                                        return Err(EvalError::UnexpectedField { got: k.to_string(), span: v.tag.clone() });
+                                    }
+                                }
+                                Ok(*ty.clone())
+                            },
+                            Type::Enum(variants) => {
+                                let variants = variants.as_table().unwrap().borrow();
+                                let enum_tag = list.next().unwrap().as_symbol().unwrap();
+                                let variant = variants.get(enum_tag).unwrap().as_type().unwrap();
+                                let unit_ty = Node::new_type(Default::default(), Type::Unit);
+                                let value = list.next().unwrap_or(&unit_ty);
+
+                                let create_variant_list = SpanNode::new_list(Default::default(), Reference::new(
+                                    vec![Node::new_type(Default::default(), variant.clone()), value.clone()]
+                                ));
+                                let got_ty = typecheck(&create_variant_list, env)?;
+                                let expected_ty = variant;
+                                if got_ty != *expected_ty {
+                                    return Err(EvalError::TypeMismatch { expected: format!("{expected_ty}"), got: got_ty, span: first_tag })
+                                }
+                                Ok(*ty.clone())
+                            },
+                            Type::String => Ok(Type::String),
+                            _ => todo!("{ty}")
+                        }
                     } else {
-                        Ok(Type::UntypedList)
+                        todo!()
                     }
                 }
             }
@@ -332,6 +382,7 @@ fn main() {
 
     // Eval
     let mut global_env = Environment::new();
+    global_env.global_set("Unit".into(), Node::new_type(Default::default(), Type::Unit));
     global_env.global_set("Any".into(), Node::new_type(Default::default(), Type::Any));
     global_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type(None)));
     global_env.global_set("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
@@ -524,15 +575,18 @@ fn main() {
     global_env.def_rust_method("struct".into(), Box::new(|mut args, env| {
         let structure = args.next().unwrap();
         assert!(structure.is_table());
-        // let structure: Result<IndexMap<_, _>, Box<dyn Error>> =
-        //     structure.borrow_mut().into_iter().map(|(k, v)| {
-        //         Ok((k, eval(v, env)?.into_type().unwrap()))
-        //     }).collect();
 
         Ok(Node::new_type(Default::default(), Type::Struct(
             Box::new(structure)
         )))
-    }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Unknown) });
+    }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
+    global_env.def_rust_method("enum".into(), Box::new(|mut args, env| {
+        let enumeration = args.next().unwrap();
+
+        Ok(Node::new_type(Default::default(), Type::Enum(
+            Box::new(enumeration)
+        )))
+    }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
     /*global_env.def_rust_method("List".into(), Box::new(|mut args, env| {
         let ty = args.next().unwrap();
 
@@ -587,13 +641,12 @@ fn main() {
 
     // Typecheck pass
     let mut type_env = TypeEnvironment::new();
-    //type_env.set("String".into(), Type::String, false);
     for (k, v) in global_env_rc.borrow().bindings.iter() {
-        println!("SETTING TE {k} = {v} i.e. {}", v.ty());
+        //println!("SETTING TE {k} = {v} i.e. {}", v.ty());
         type_env.set(k.clone(), v.ty(), false);
         if v.ty().is_function() {
             for method in v.as_typed().unwrap().1.as_list().unwrap().borrow().iter() {
-                println!(" - {method}");
+                //println!(" - {method}");
                 type_env.def(k.clone(), method.ty());
             }
         }

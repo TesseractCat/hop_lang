@@ -1,4 +1,4 @@
-use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, ops::Deref, rc::Rc};
+use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, hash::Hash, ops::Deref, rc::Rc};
 
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
@@ -7,13 +7,13 @@ use smol_str::SmolStr;
 
 use crate::eval::{Environment, EvalError};
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Implementation {
     pub func: SmolStr,
     pub params: Vec<Type>,
     pub ret: Box<Type>
 }
-#[derive(Debug, PartialEq, Clone, EnumAsInner)]
+#[derive(Debug, PartialEq, Eq, Clone, EnumAsInner, Hash)]
 pub enum Type {
     Type(Option<Box<Type>>),
     Placeholder(Option<SmolStr>),
@@ -21,9 +21,10 @@ pub enum Type {
     Any,
     Unknown,
     Symbol,
+    Keyword,
+    String,
     Bool,
     Number,
-    String,
 
     UntypedList,
     UntypedTable,
@@ -44,13 +45,14 @@ impl Type {
         if self == rhs { return true; }
         match rhs {
             Self::Any | Self::Unknown => return true,
+            //Self::Implements(_) if !matches!(self, Self::Implements(_)) => return rhs.compatible(self, get_methods, placeholder_matches),
             _ => ()
         };
         match self {
             Self::Any | Self::Unknown => true,
             Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
             Self::Implements(implementations) if matches!(rhs, Self::Implements(_)) => {
-                todo!("compatible between imp types")
+                todo!("compat between imp types")
             },
             Self::Implements(implementations) => {
                 for imp in implementations {
@@ -153,9 +155,15 @@ impl<T> PartialEq for Reference<T> {
         Rc::ptr_eq(&self.0, &other.0)
     }
 }
+impl<T> Eq for Reference<T> { }
 impl<T: Display> Display for Reference<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.borrow().fmt(f)
+    }
+}
+impl<T> Hash for Reference<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.0.as_ptr(), state)
     }
 }
 pub type Callback = dyn Fn(std::vec::IntoIter<SpanNode>, &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError>;
@@ -199,7 +207,7 @@ impl Display for Method {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Eq, Clone)]
 pub struct Node<T: Clone> {
     pub tag: T,
     pub node: NodeValue<T>
@@ -210,15 +218,40 @@ impl<T: Clone> Deref for Node<T> {
         &self.node
     }
 }
+impl<T: Clone + PartialEq> PartialEq for Node<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+    }
+}
+impl<T: Clone + Hash> Hash for Node<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.node.hash(state)
+    }
+}
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct HashedFloat(f64);
+impl Hash for HashedFloat {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state)
+    }
+}
+impl Eq for HashedFloat { }
+impl Display for HashedFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self, f)
+    }
+}
 pub type SpanNode = Node<Span>;
-#[derive(Debug, PartialEq, Clone, EnumAsInner)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, EnumAsInner)]
 pub enum NodeValue<T: Clone> {
     Symbol(SmolStr),
-    Bool(bool),
-    Number(f64),
     String(SmolStr),
+    Keyword(SmolStr),
+
+    Bool(bool),
+    Number(HashedFloat),
     List(Reference<Vec<Node<T>>>),
-    Table(Reference<IndexMap<SmolStr, Node<T>>>),
+    Table(Reference<IndexMap<Node<T>, Node<T>>>),
 
     Method(Reference<Method>), // Each function is a list of methods (for multiple dispatch)
     Type(Type),
@@ -232,10 +265,12 @@ impl<T: Clone> Display for Node<T> {
 impl<T: Clone> Display for NodeValue<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bool(val) => write!(f, "{val}"),
-            Self::Number(val) => write!(f, "{val}"),
             Self::String(val) => write!(f, r#""{val}""#),
             Self::Symbol(val) => write!(f, "'{val}"),
+            Self::Keyword(val) => write!(f, ":{val}"),
+
+            Self::Bool(val) => write!(f, "{val}"),
+            Self::Number(val) => write!(f, "{val}"),
             Self::List(list) => {
                 write!(f, "( ")?;
                 for item in list.borrow().iter() {
@@ -266,22 +301,25 @@ impl<T: Clone> Node<T> {
     pub fn new_string(tag: T, val: SmolStr) -> Self {
         Self { tag, node: NodeValue::String(val) }
     }
+    pub fn new_keyword(tag: T, val: SmolStr) -> Self {
+        Self { tag, node: NodeValue::Keyword(val) }
+    }
     pub fn new_bool(tag: T, val: bool) -> Self {
         Self { tag, node: NodeValue::Bool(val) }
     }
     pub fn new_number(tag: T, val: f64) -> Self {
-        Self { tag, node: NodeValue::Number(val) }
+        Self { tag, node: NodeValue::Number(HashedFloat(val)) }
     }
-    pub fn new_list(tag: T, val: Reference<Vec<Node<T>>>) -> Self {
+    pub fn new_list(tag: T, val: Reference<Vec<Self>>) -> Self {
         Self { tag, node: NodeValue::List(val) }
     }
-    pub fn new_table(tag: T, val: Reference<IndexMap<SmolStr, Node<T>>>) -> Self {
+    pub fn new_table(tag: T, val: Reference<IndexMap<Self, Self>>) -> Self {
         Self { tag, node: NodeValue::Table(val) }
     }
     pub fn new_method(tag: T, val: Reference<Method>) -> Self {
         Self { tag, node: NodeValue::Method(val) }
     }
-    pub fn new_typed(tag: T, ty: Type, val: Node<T>) -> Self {
+    pub fn new_typed(tag: T, ty: Type, val: Self) -> Self {
         Self { tag, node: NodeValue::Typed(ty, Box::new(val)) }
     }
     pub fn new_type(tag: T, ty: Type) -> Self {
@@ -294,6 +332,7 @@ impl<T: Clone> Node<T> {
             NodeValue::Number(_) => Type::Number,
             NodeValue::String(_) => Type::String,
             NodeValue::Symbol(_) => Type::Symbol,
+            NodeValue::Keyword(_) => Type::Keyword,
             NodeValue::List(_) => Type::UntypedList,
             NodeValue::Table(_) => Type::UntypedTable,
 
@@ -317,13 +356,16 @@ impl<T: Clone> Node<T> {
         self.node.into_bool().map_err(|val| Self { tag: self.tag, node: val })
     }
     pub fn into_number(self) -> Result<f64, Self> {
-        self.node.into_number().map_err(|val| Self { tag: self.tag, node: val })
+        self.node.into_number().map_err(|val| Self { tag: self.tag, node: val }).map(|x| x.0)
     }
     pub fn into_symbol(self) -> Result<SmolStr, Self> {
         self.node.into_symbol().map_err(|val| Self { tag: self.tag, node: val })
     }
     pub fn into_string(self) -> Result<SmolStr, Self> {
         self.node.into_string().map_err(|val| Self { tag: self.tag, node: val })
+    }
+    pub fn into_keyword(self) -> Result<SmolStr, Self> {
+        self.node.into_keyword().map_err(|val| Self { tag: self.tag, node: val })
     }
     pub fn into_method(self) -> Result<Reference<Method>, Self> {
         self.node.into_method().map_err(|val| Self { tag: self.tag, node: val })
@@ -334,7 +376,7 @@ impl<T: Clone> Node<T> {
     pub fn into_list(self) -> Result<Reference<Vec<Self>>, Node<T>> {
         self.node.into_list().map_err(|val| Self { tag: self.tag, node: val })
     }
-    pub fn into_table(self) -> Result<Reference<IndexMap<SmolStr, Self>>, Node<T>> {
+    pub fn into_table(self) -> Result<Reference<IndexMap<Self, Self>>, Node<T>> {
         self.node.into_table().map_err(|val| Self { tag: self.tag, node: val })
     }
     pub fn into_typed(self) -> Result<(Type, Box<Self>), Node<T>> {

@@ -25,7 +25,16 @@ print (lift foo 6);
 
 def test [x: static (Option String)] -> (static Number) { print x; 420 };
 def test [x: static Number] -> (static Number) { print x; x };
-print ((static (Option String)) Some "Meow");
+let e ((static (Option String)) :Some "Meow");
+//match e [
+//    Some x: {
+//
+//    },
+//    None: {
+//
+//    }
+//];
+print e;
 test 420;
 
 //def ident [x: static String] -> (static String) { x };

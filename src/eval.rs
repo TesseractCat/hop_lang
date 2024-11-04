@@ -251,9 +251,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                         }).count() == param_count
                     {
                         return callback(
-                            call_args.into_iter()
-                                .map(|arg| eval(arg, env))
-                                .collect::<Result<Vec<_>, _>>()?.into_iter(),
+                            call_args.into_iter(),
                             env
                         );
                     }
@@ -271,7 +269,8 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
             },
             Type::Enum(ref variants) => {
                 let variants = variants.as_table().unwrap().borrow();
-                let enum_tag = args.next().unwrap().into_symbol().unwrap();
+                let enum_tag = args.next().unwrap();
+                assert!(enum_tag.is_keyword());
                 let variant = variants.get(&enum_tag).unwrap().as_type().unwrap();
                 let value = args.next().unwrap_or_else(|| todo!());
 
@@ -286,8 +285,8 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                 }
                 Ok(Node::new_typed(func.tag.clone(), ty.clone(),
                     Node::new_table(func.tag, Reference::new(IndexMap::from([
-                        ("tag".into(), Node::new_type(Default::default(), variant.clone())),
-                        ("value".into(), got),
+                        (Node::new_symbol(Default::default(), "tag".into()), enum_tag.clone()),
+                        (Node::new_symbol(Default::default(), "value".into()), got),
                     ])))
                 ))
             },
@@ -302,7 +301,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
 }
 pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
     match node.node {
-        NodeValue::Bool(_) | NodeValue::Number(_) | NodeValue::String(_) | NodeValue::Type(_) | NodeValue::Typed(_, _) => Ok(node),
+        NodeValue::Bool(_) | NodeValue::Number(_) | NodeValue::String(_) | NodeValue::Keyword(_) | NodeValue::Type(_) | NodeValue::Typed(_, _) => Ok(node),
         NodeValue::Symbol(name) => {
             Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag })?.clone())
         },
@@ -318,11 +317,11 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
             }
         },
         NodeValue::Table(ref table) => {
-            let mut new_table: IndexMap<SmolStr, SpanNode> = IndexMap::new();
+            let mut new_table: IndexMap<SpanNode, SpanNode> = IndexMap::new();
             {
                 let table = table.borrow();
                 for (k, v) in table.iter() {
-                    new_table.insert(k.clone(), eval(v.clone(), env)?);
+                    new_table.insert(eval(k.clone(), env)?, eval(v.clone(), env)?);
                 }
             }
             Ok(Node::new_table(node.tag, Reference::new(new_table)))

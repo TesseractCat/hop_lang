@@ -1,65 +1,12 @@
-let Dumbell (struct [
-    weight: Number
-]);
-let Cat (struct [
-    cuteness: Number
-]);
-let Building (struct [
-    height: Number
-]);
-def lift [this: Dumbell, strength: Number] -> Number { print "oof"; print this.weight; 0 };
-def lift [this: Cat, strength: Number] -> Number { print "meow"; print this.cuteness; 0 };
-def liftany [this: imp (lift _ Number -> Number), strength: Number] -> Number {
-    lift this strength
+static {
+    global-set Dumbell (struct [
+        weight: Number
+    ]);
+    def lift [x: static Dumbell] -> (static Number) { x.weight };
+    def liftmore [x: static Dumbell] -> (static Number) { x.weight };
 };
-def test [] -> Unknown {
-    def lifttwo [a: imp (lift _T Number -> Unknown), b: imp (lift _T Number -> Number), strength: Number] -> Number {
-        lift a strength;
-        lift b strength
-    };
+def factory [weight: static Number] -> (static (imp (lift _ -> Number))) {
+    ((static Dumbell) [weight: (+ weight 9)])
 };
-def test [x: Number] -> Number { x };
-if (lt (rand) 0.5) {
-    set test "nooo";
-}
-print test;
-test;
-def wowow [] -> (imp (lift _ Number -> Number)) {
-    Cat [cuteness: 37]
-};
-//def system (fn [query: Query Name (With Person)] {
-//    for name in query {
-//        
-//    }
-//});
-//comptime Query (fn [type: Type] -> Type {
-//    let qt (struct []);
-//    global-def next (fn [this: qt] -> type {
-//
-//    });
-//});
-//def liftany (fn [this: imp (lift _ -> Number), strength: Number] -> Number { lift this strength });
-//def mergelists (fn [a: imp next _ -> (imp cmp _T _T -> Bool), b: imp next _ -> (imp cmp _T _T -> Bool)])
-//def mergelists (fn [a: List Number, b: List String] { mergelists a b })
-
-def getval [this: Dumbell] -> Number { this.weight };
-def getval [this: Cat] -> Number { this.cuteness };
-def getval [this: Number] -> Number { this };
-
-def eq [a: Number, b: Number] -> Bool { = a b };
-def eqval [a: imp (getval _ -> Number), b: imp (getval _ -> Number)] -> Bool { eq (getval a) (getval b) };
-
-let foo Dumbell.([
-    weight: 5
-]);
-let bar Cat.([
-    cuteness: 9001
-]);
-let baz Building.([
-    height: 100
-]);
-lift foo 2;
-liftany bar 2;
-print "LIFTING TWO";
-lifttwo (wowow) bar 69;
-print (eqval foo 5);
+lift (factory 10);
+liftmore (factory 10)

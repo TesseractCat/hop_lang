@@ -38,7 +38,7 @@ impl ParseError {
     }
 }
 
-#[derive(Debug, Logos)]
+#[derive(Debug, Logos, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n\f]+")] // Ignore whitespace
 #[logos(skip r"//[^\r\n]*(\r\n|\n)?")] // Ignore comments
 pub enum Token {
@@ -68,6 +68,9 @@ pub enum Token {
     Semicolon,
     #[token(",")]
     Comma,
+    
+    #[token("'")]
+    Quote,
 
     #[token("false", |_| false)]
     #[token("true", |_| true)]
@@ -84,6 +87,11 @@ pub enum Token {
 
     #[regex(r#"[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| SmolStr::from(lex.slice()))]
     Symbol(SmolStr),
+    #[regex(r#":[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| {
+        let m = lex.slice();
+        SmolStr::from(&m[1..m.len()])
+    })]
+    Keyword(SmolStr),
 
     // Sugar
     #[regex(r#"\.\("#)]
@@ -93,9 +101,9 @@ pub enum Token {
     Deref,
 }
 
-// foo(1 2 3) -> (call foo (1 2 3))
+// foo.(1 2 3) -> (call foo (1 2 3))
 pub fn parse_call(lexer: &mut Lexer<'_, Token>, lhs: SpanNode) -> Result<SpanNode, ParseError> {
-    let l = parse_list(lexer)?;
+    let (l, _) = parse_list(lexer, &[Token::ListClose])?;
     let l = l.node.into_list().map_err(|_| ParseError::Generic(lexer.span()))?;
     let mut res = vec![Node::new_symbol(lexer.span(), "call".into()), lhs];
     res.append(&mut l.borrow_mut());
@@ -107,7 +115,7 @@ pub fn parse_deref(lexer: &mut Lexer<'_, Token>, lhs: SpanNode) -> Result<SpanNo
     match token {
         Token::Symbol(rhs) => {
             Ok(Node::new_list(
-                lexer.span(), Reference::new(vec![Node::new_symbol(lexer.span(), "get".into()), lhs, Node::new_symbol(lexer.span(), rhs)])
+                lexer.span(), Reference::new(vec![Node::new_symbol(lexer.span(), "get".into()), lhs, Node::new_keyword(lexer.span(), rhs)])
             ))
         },
         _ => Err(ParseError::ExpectedSymbol { got: token, span: lexer.span() })
@@ -115,104 +123,107 @@ pub fn parse_deref(lexer: &mut Lexer<'_, Token>, lhs: SpanNode) -> Result<SpanNo
 }
 // [a: "hi", b: 2]
 pub fn parse_table(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
-    let mut table: IndexMap<SmolStr, SpanNode> = IndexMap::new();
+    let mut table: IndexMap<SpanNode, SpanNode> = IndexMap::new();
     let mut want_key = true;
-    let mut key: SmolStr = SmolStr::default();
     let start = lexer.span().start;
 
-    let mut res: Vec<SpanNode> = Vec::new();
-    while let Some(Ok(token)) = lexer.next() {
+    let mut key: Vec<SpanNode> = Vec::new();
+    let mut value: Vec<SpanNode> = Vec::new();
+
+    loop {
         if want_key {
-            match token {
-                Token::Symbol(str) => key = str.into(),
-                Token::Colon | Token::Comma => {
-                    want_key = false;
-                },
-                Token::TableClose => {
-                    return Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
-                },
-                token => return Err(ParseError::ExpectedSymbol { got: token, span: lexer.span() })
-            };
+            let (list, stop_token) = parse_list(lexer, &[Token::Colon, Token::TableClose])?;
+            key = mem::take(&mut *list.into_list().unwrap().borrow_mut());
+            want_key = !want_key;
+            if stop_token == Token::TableClose {
+                break;
+            }
         } else {
-            match token {
-                Token::ListOpen => res.push(parse_list(lexer)?),
-                Token::BlockOpen => res.push(parse_block(lexer)?),
-                Token::TableOpen => res.push(parse_table(lexer)?),
-    
-                Token::Bool(bool) => res.push(Node::new_bool(lexer.span(), bool)),
-                Token::Number(num) => res.push(Node::new_number(lexer.span(), num)),
-                Token::String(str) => res.push(Node::new_string(lexer.span(), str)),
-                Token::Symbol(str) => res.push(Node::new_symbol(lexer.span(), str)),
-
-                Token::Call => {
-                    if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
-                    let lhs = res.remove(res.len() - 1);
-                    res.push(parse_call(lexer, lhs)?)
-                },
-                Token::Deref => {
-                    if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
-                    let lhs = res.remove(res.len() - 1);
-                    res.push(parse_deref(lexer, lhs)?)
-                },
-
-                Token::Colon | Token::Comma => {
-                    if res.len() == 1 {
-                        table.insert(mem::take(&mut key), mem::take(&mut res).into_iter().next().unwrap());
-                    } else {
-                        table.insert(mem::take(&mut key), Node::new_list(
-                            lexer.span(), Reference::new(mem::take(&mut res))
-                        ));
+            let (list, stop_token) = parse_list(lexer, &[Token::Comma, Token::TableClose])?;
+            value = mem::take(&mut *list.into_list().unwrap().borrow_mut());
+            table.insert(
+                if key.len() == 1 {
+                    let key = mem::take(&mut key).into_iter().next().unwrap();
+                    let key_tag = key.tag.clone();
+                    match key.into_symbol() {
+                        Ok(key_symbol) => Node::new_keyword(key_tag, key_symbol),
+                        Err(key) => key,
                     }
-                    want_key = true;
+                } else {
+                    Node::new_list(
+                        lexer.span(), Reference::new(mem::take(&mut key))
+                    )
                 },
-                Token::TableClose => {
-                    if res.len() == 1 {
-                        table.insert(mem::take(&mut key), mem::take(&mut res).into_iter().next().unwrap());
-                    } else {
-                        table.insert(mem::take(&mut key), Node::new_list(
-                            lexer.span(), Reference::new(mem::take(&mut res))
-                        ));
-                    }
-                    return Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
-                },
-                token => return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
-            };
+                if value.len() == 1 {
+                    mem::take(&mut value).into_iter().next().unwrap()
+                } else {
+                    Node::new_list(
+                        lexer.span(), Reference::new(mem::take(&mut value))
+                    )
+                }
+            );
+            want_key = !want_key;
+            if stop_token == Token::TableClose {
+                break;
+            }
         }
     }
+
     Ok(Node::new_table(start..lexer.span().end, Reference::new(table)))
 }
 // (a 123 false)
-pub fn parse_list(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError> {
+pub fn parse_list(lexer: &mut Lexer<'_, Token>, stop_tokens: &[Token]) -> Result<(SpanNode, Token), ParseError> {
     let mut res: Vec<SpanNode> = Vec::new();
     let start = lexer.span().start;
 
+    let mut quoting = false;
+    let mut quote_span = Span::default();
     while let Some(token) = lexer.next() {
-        match token.map_err(|_| ParseError::Generic(lexer.span()))? {
-            Token::ListClose => return Ok(Node::new_list(start..lexer.span().end, Reference::new(res))),
+        let node = match token.map_err(|_| ParseError::Generic(lexer.span()))? {
+            Token::ListOpen => Some(parse_list(lexer, &[Token::ListClose])?.0),
+            Token::BlockOpen => Some(parse_block(lexer)?),
+            Token::TableOpen => Some(parse_table(lexer)?),
 
-            Token::ListOpen => res.push(parse_list(lexer)?),
-            Token::BlockOpen => res.push(parse_block(lexer)?),
-            Token::TableOpen => res.push(parse_table(lexer)?),
+            Token::Quote => { quoting = true; quote_span = lexer.span(); None },
 
-            Token::Bool(bool) => res.push(Node::new_bool(lexer.span(), bool)),
-            Token::Number(num) => res.push(Node::new_number(lexer.span(), num)),
-            Token::String(str) => res.push(Node::new_string(lexer.span(), str)),
-            Token::Symbol(str) => res.push(Node::new_symbol(lexer.span(), str)),
+            Token::Bool(bool) => Some(Node::new_bool(lexer.span(), bool)),
+            Token::Number(num) => Some(Node::new_number(lexer.span(), num)),
+            Token::String(str) => Some(Node::new_string(lexer.span(), str)),
+            Token::Symbol(str) => Some(Node::new_symbol(lexer.span(), str)),
+            Token::Keyword(str) => Some(Node::new_keyword(lexer.span(), str)),
 
             Token::Call => {
                 if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
                 let lhs = res.remove(res.len() - 1);
-                res.push(parse_call(lexer, lhs)?)
+                Some(parse_call(lexer, lhs)?)
             },
             Token::Deref => {
                 if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
                 let lhs = res.remove(res.len() - 1);
-                res.push(parse_deref(lexer, lhs)?)
+                Some(parse_deref(lexer, lhs)?)
             },
-            token => return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
+            token => {
+                for stop_token in stop_tokens {
+                    if token == *stop_token {
+                        return Ok((Node::new_list(start..lexer.span().end, Reference::new(res)), stop_token.clone()));
+                    }
+                }
+                return Err(ParseError::UnexpectedToken { got: token, span: lexer.span() })
+            }
+        };
+        if let Some(node) = node {
+            if quoting {
+                res.push(Node::new_list(node.tag.clone(), Reference::new(vec![
+                    Node::new_symbol(quote_span.clone(), "quote".into()),
+                    node
+                ])));
+                quoting = false;
+            } else {
+                res.push(node);
+            }
         }
     }
-    Ok(Node::new_list(start..lexer.span().end, Reference::new(res)))
+    panic!("EOF while reading list")
 }
 // A block is like a list but each semicolon-separated line gets it's own list
 // {
@@ -244,7 +255,7 @@ pub fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError>
                 res.push(Node::new_list(lexer.span(), Reference::new(list)));
             },
 
-            Token::ListOpen => list.push(parse_list(lexer)?),
+            Token::ListOpen => list.push(parse_list(lexer, &[Token::ListClose])?.0),
             Token::TableOpen => list.push(parse_table(lexer)?),
             Token::BlockOpen => list.push(parse_block(lexer)?),
 
@@ -252,6 +263,7 @@ pub fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError>
             Token::Number(num) => list.push(Node::new_number(lexer.span(), num)),
             Token::String(str) => list.push(Node::new_string(lexer.span(), str)),
             Token::Symbol(str) => list.push(Node::new_symbol(lexer.span(), str)),
+            Token::Keyword(str) => list.push(Node::new_keyword(lexer.span(), str)),
 
             Token::Call => {
                 if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }

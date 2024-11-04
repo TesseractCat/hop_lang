@@ -1,5 +1,6 @@
 use codespan_reporting::{diagnostic::{Diagnostic, Label}, files::SimpleFiles, term::termcolor::{ColorChoice, StandardStream}};
 use eval::{Environment, EvalError};
+use indexmap::IndexMap;
 use logos::{Logos, Span};
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -58,6 +59,25 @@ impl TypeEnvironment {
                 }
             }
             let r = env.borrow().bindings.get(name).cloned();
+            r
+        } else {
+            None
+        }
+    }
+    pub fn get_function(&self, name: &SmolStr) -> Option<Vec<Type>> {
+        if let Some(binding) = self.functions.get(name) {
+            Some(binding.clone())
+        } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
+            let mut env = up;
+            while env.borrow().functions.get(name).is_none() {
+                let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
+                if let Some(up) = up {
+                    env = up;
+                } else {
+                    break;
+                }
+            }
+            let r = env.borrow().functions.get(name).cloned();
             r
         } else {
             None
@@ -125,7 +145,7 @@ pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterato
 {
     let env = env.borrow();
     let call_tys: Vec<_> = args.collect();
-    if let Some(methods) = env.functions.get(func) {
+    if let Some(methods) = env.get_function(&func.into()) {
         let get_methods = |func: &str| -> Option<Vec<Type>> {
             Some(env.functions.get(&SmolStr::from(func))?.clone())
         };
@@ -144,12 +164,16 @@ pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterato
     
             let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
             if method_param_tys.iter().zip(&call_tys)
-                .filter(|&(a, b)| {
-                    if a.compatible(b, &get_methods, &mut placeholder_matches) {
-                        true
+                .filter(|&(lhs, rhs)| {
+                    if let Type::Implements(implementations) = rhs {
+                        todo!("imp types as args")
                     } else {
-                        // println!("    - {a} not compatible with {b}");
-                        false
+                        if lhs.compatible(rhs, &get_methods, &mut placeholder_matches) {
+                            true
+                        } else {
+                            println!("    - {lhs} not compatible with {rhs}");
+                            false
+                        }
                     }
                 }).count() == param_count
             {
@@ -223,7 +247,8 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     let arrow = list.next().unwrap();
                     let ret = list.next().unwrap().clone();//eval(list.next().unwrap().clone(), &ty_env.borrow().static_env)?;
 
-                    let param_names: Vec<SmolStr> = params.as_table().unwrap().borrow().keys().cloned().collect();
+                    let param_names: Vec<SmolStr> = params.as_table().unwrap().borrow()
+                        .keys().cloned().map(|n| n.into_keyword().unwrap()).collect();
                     let param_tys: Vec<Type> = params.as_table().unwrap().borrow().values().map(|v| v.as_type().unwrap().clone()).collect();
                     let ret_ty = ret.into_type().unwrap();
 
@@ -283,8 +308,10 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                             },
                             Type::Enum(variants) => {
                                 let variants = variants.as_table().unwrap().borrow();
-                                let enum_tag = list.next().unwrap().as_symbol().unwrap();
-                                let variant = variants.get(enum_tag).unwrap().as_type().unwrap();
+                                let enum_tag = list.next().unwrap();
+                                assert!(enum_tag.is_keyword());
+                                println!("getting {enum_tag:?} from {variants:?}");
+                                let variant = variants.get(enum_tag).expect("Invalid variant").as_type().unwrap();
                                 let unit_ty = Node::new_type(Default::default(), Type::Unit);
                                 let value = list.next().unwrap_or(&unit_ty);
 
@@ -317,6 +344,7 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
         NodeValue::Bool(_)
             | NodeValue::Number(_)
             | NodeValue::String(_)
+            | NodeValue::Keyword(_)
             | NodeValue::Symbol(_)
             | NodeValue::Type(_)
             | NodeValue::Typed(_, _) => Ok(node),
@@ -342,11 +370,14 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
         },
         NodeValue::Table(ref table) => {
             {
-                let mut table = table.borrow_mut();
-                table.values_mut().map(|val| {
-                    let _ = mem::replace(val, eval_static(val.clone(), env)?);
-                    Ok::<_, EvalError>(())
-                }).collect::<Result<(), _>>()?;
+                let mut t = mem::take(&mut *table.borrow_mut());
+                t = t.into_iter().map(|(key, val)| {
+                    Ok::<_, EvalError>((
+                        eval_static(key, env)?,
+                        eval_static(val, env)?
+                    ))
+                }).collect::<Result<IndexMap<_, _>, _>>()?;
+                let _ = mem::replace(&mut *table.borrow_mut(), t);
             }
             Ok(node)
         },
@@ -457,14 +488,25 @@ fn main() {
         }
         Ok(res)
     }));
+    global_env.def_rust_macro("quote".into(), Box::new(|mut args, env| {
+        Ok(args.next().unwrap())
+    }));
+    global_env.def_rust_macro("static".into(), Box::new(|mut args, env| {
+        let mut res = Node::new_list(Default::default(), Reference::new(Vec::new()));
+
+        if let Some(arg) = args.next() {
+            res = eval(arg, &env)?;
+        }
+        Ok(res)
+    }));
     global_env.def_rust_macro("get".into(), Box::new(|mut args, env| {
         let (ty, var) = eval(args.next().unwrap(), env)?.with_type();
         let key = args.next().unwrap();
 
         if let NodeValue::Table(map) = var.node {
-            Ok(map.borrow().get(key.as_symbol().unwrap()).unwrap().clone())
+            Ok(map.borrow().get(&key).unwrap().clone())
         } else if let NodeValue::List(list) = var.node {
-            Ok(list.borrow().get(*key.as_number().unwrap() as usize).unwrap().clone())
+            Ok(list.borrow().get(key.into_number().unwrap() as usize).unwrap().clone())
         } else {
             panic!("Can only get from table/list objects, got: {var}")
         }
@@ -549,7 +591,7 @@ fn main() {
             })?)
         };
         Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
-            param_names: params.keys().cloned().collect(),
+            param_names: params.keys().cloned().map(|n| n.into_keyword().unwrap()).collect(),
             env: Rc::clone(env), body: Box::new(block), ty: func_ty
         })))
     }));

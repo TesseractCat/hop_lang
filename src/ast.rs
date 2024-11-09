@@ -1,4 +1,4 @@
-use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, hash::Hash, ops::Deref, rc::Rc};
+use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, hash::Hash, io::empty, ops::Deref, rc::Rc};
 
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
@@ -42,17 +42,69 @@ pub enum Type {
 }
 impl Type {
     pub fn compatible(self: &Type, rhs: &Type, get_methods: &impl Fn(&str) -> Option<Vec<Type>>, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
+        // Compatibility such that rhs can be used in place of self
+
+        // Strict equality
         if self == rhs { return true; }
+
+        // More complicated cases
         match rhs {
             Self::Any | Self::Unknown => return true,
-            //Self::Implements(_) if !matches!(self, Self::Implements(_)) => return rhs.compatible(self, get_methods, placeholder_matches),
             _ => ()
         };
         match self {
             Self::Any | Self::Unknown => true,
             Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
-            Self::Implements(implementations) if matches!(rhs, Self::Implements(_)) => {
-                todo!("compat between imp types")
+            Self::Placeholder(_) => todo!(),
+            Self::Implements(imp_lhs) if matches!(rhs, Self::Implements(_)) => {
+                if let Self::Implements(imp_rhs) = rhs {
+                    // imp_lhs \subseteq imp_rhs
+                    // lhs placeholder variables must maintain a mapping to rhs types
+                    for target in imp_lhs {
+                        let mut in_superset = false;
+                        // Search for a matching implementation on the rhs
+                        for x in imp_rhs {
+                            if x.func == target.func
+                                && x.params.len() == target.params.len()
+                                && x.ret.compatible(&*target.ret, get_methods, placeholder_matches)
+                            {
+                                let mut params_compatible = true;
+                                let mut empty_placeholder: Option<Type> = None;
+                                for (a, b) in target.params.iter().zip(x.params.iter()) {
+                                    if let Self::Placeholder(None) = a {
+                                        // Empty placeholders within an implementation must
+                                        // all be the same type
+                                        if let Some(ref empty_placeholder_ty) = empty_placeholder {
+                                            if empty_placeholder_ty != b {
+                                                params_compatible = false;
+                                                break;
+                                            }
+                                        } else {
+                                            empty_placeholder = Some(b.clone());
+                                        }
+                                    } else if let Self::Placeholder(Some(ref placeholder)) = a {
+                                        // Placeholders within all implementations must
+                                        // all be the same type
+                                        if let Some(placeholder_ty) = placeholder_matches.get(placeholder) {
+                                            if placeholder_ty != b {
+                                                params_compatible = false;
+                                                break;
+                                            }
+                                        } else {
+                                            placeholder_matches.insert(placeholder.clone(), b.clone());
+                                        }
+                                    } else if !a.compatible(b, get_methods, placeholder_matches) {
+                                        params_compatible = false;
+                                        break;
+                                    }
+                                }
+                                if params_compatible { in_superset = true; }
+                            }
+                        }
+                        if !in_superset { return false; }
+                    }
+                    true
+                } else { false }
             },
             Self::Implements(implementations) => {
                 for imp in implementations {

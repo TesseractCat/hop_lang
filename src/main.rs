@@ -156,29 +156,48 @@ pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterato
             panic!("Encountered macro {func_symbol}. Macros must be implemented earlier in the typecheck process");
         }
     
-        for method in methods {
+        'incompatible: for method in methods {
             let method_ty = method.as_method().unwrap();
             let method_param_tys = method_ty.0;
             let method_ret_ty = method_ty.1;
             let param_count = method_param_tys.len();
     
             let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
-            if method_param_tys.iter().zip(&call_tys)
-                .filter(|&(lhs, rhs)| {
-                    if let Type::Implements(implementations) = rhs {
-                        todo!("imp types as args")
-                    } else {
-                        if lhs.compatible(rhs, &get_methods, &mut placeholder_matches) {
-                            true
-                        } else {
-                            println!("    - {lhs} not compatible with {rhs}");
-                            false
+
+            for (i, (lhs, rhs)) in method_param_tys.iter().zip(&call_tys).enumerate() {
+                // First check if this type can be used with the function we're calling right now
+                if let Type::Implements(implementations) = rhs {
+                    let mut compatible = false;
+                    for imp in implementations {
+                        if imp.func == func && imp.ret == *method_ret_ty {
+                            if let Type::Placeholder(ref placeholder) = imp.params[i] {
+                                // Keep track of placeholders
+                                // FIXME: Need seperate dict for these placeholders?
+                                if let Some(placeholder) = placeholder {
+                                    if let Some(match_ty) = placeholder_matches.get(placeholder) {
+                                        if rhs == match_ty {
+                                            compatible = true;
+                                        }
+                                    } else {
+                                        placeholder_matches.insert(placeholder.clone(), rhs.clone());
+                                    }
+                                } else {
+                                    compatible = true;
+                                }
+                            }
                         }
                     }
-                }).count() == param_count
-            {
-                return Ok(*method_ret_ty.clone());
+                    if compatible { continue; }
+                }
+                // Otherwise check for argument compatibility
+                if lhs.compatible(rhs, &get_methods, &mut placeholder_matches) {
+                    continue;
+                }
+                // If neither, it's incompatible
+                println!("    - {lhs} not compatible with {rhs}");
+                continue 'incompatible;
             }
+            return Ok(*method_ret_ty.clone());
         }
     }
     Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
@@ -277,7 +296,10 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
 
                     Ok(Type::UntypedList)
                 },
-                Some("print") => Ok(Type::Unknown),
+                Some("print") => {
+                    let val = list.next().unwrap();
+                    typecheck(val, env)
+                },
                 Some("call") => {
                     unimplemented!()
                 },

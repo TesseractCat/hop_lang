@@ -2,11 +2,30 @@ static {
     global-set Dumbell (struct [
         weight: Number
     ]);
+    def eq [x: Number, y: Number] -> Bool { = x y };
+    def eq [x: static Dumbell, y: static Dumbell] -> (static Bool) { = x.weight y.weight };
+    def lift [x: static Dumbell] -> (static String) { "meow" };
     def lift [x: static Dumbell] -> (static Number) { x.weight };
     def liftmore [x: static Dumbell] -> (static Number) { x.weight };
+    
+    def test [x: imp (eq _a _a -> Bool), y: imp (eq _a _a -> Bool)] -> Bool { eq x y };
 };
-def factory [weight: static Number] -> (static (imp (lift _ -> Number))) {
+def factory [weight: static Number] -> (static (imp (lift _ -> Number) (eq _ _ -> Bool))) {
     ((static Dumbell) [weight: (+ weight 9)])
 };
-lift (factory 10);
-liftmore (factory 10)
+print "LIFTING";
+let x 0;
+//set x (lift (factory 10));
+//print (lift (factory 10));
+
+print (test (factory 10) (factory 10));
+//print (test (factory 10) 10);
+//liftmore (factory 10)
+
+//Let's say we've got a function `lift`. We will iterate through all methods of that function.
+//For each method, we will iterate through all arguments and compare with the passed arguments.
+//
+//If the argument is a type, the comparison is simple equality.
+//If the argument is an imp, the comparison is more tricky:
+//- First we'll check if the imp contains `lift`, if it doesn't, we're done.
+//- If it does, we'll check if it has a placeholder in the right position.

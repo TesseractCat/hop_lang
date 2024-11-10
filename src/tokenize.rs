@@ -85,7 +85,7 @@ pub enum Token {
     })]
     String(SmolStr),
 
-    #[regex(r#"[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| SmolStr::from(lex.slice()))]
+    #[regex(r#"[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=!><]*"#, |lex| SmolStr::from(lex.slice()))]
     Symbol(SmolStr),
     #[regex(r#":[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| {
         let m = lex.slice();

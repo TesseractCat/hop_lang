@@ -17,8 +17,8 @@ pub enum EvalError {
     NoMethodMatches { span: Span },
     #[error("attempted to call non-func as func")]
     CalledNonFunc { span: Span },
-    #[error("attempted to dereference undefined variable")]
-    UndefinedVar { span: Span },
+    #[error("attempted to dereference undefined variable `{name}`")]
+    UndefinedVar { name: String, span: Span },
     #[error("error")]
     Generic(Span)
 }
@@ -151,7 +151,10 @@ impl Environment {
         )))
     }
     pub fn def_rust_macro(&mut self, name: SmolStr, value: Box<Callback>) {
-        self.def_rust_method(name, value, Type::Unknown);
+        self.def_rust_method(name, value, Type::Macro);
+    }
+    pub fn def_special_form(&mut self, name: SmolStr, value: Box<Callback>) {
+        self.def_rust_method(name, value, Type::SpecialForm);
     }
 }
 
@@ -169,10 +172,10 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         let methods = func.with_type().1.into_list().unwrap();
         let methods: Vec<Reference<Method>> = methods.borrow().iter().cloned().map(|m| m.into_method().unwrap()).collect();
         
-        let is_macro = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::Unknown, .. })).unwrap_or_default();
+        let is_special_form = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::SpecialForm, .. })).unwrap_or_default();
         let (call_tys, call_args): (Vec<_>, Vec<_>) =
             args.map(|arg| {
-                if is_macro {
+                if is_special_form {
                     Ok((arg.ty(), arg))
                 } else {
                     let evaled = eval(arg, env)?;
@@ -230,7 +233,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     }
                 },
                 Method::Rust { callback, ty } => {
-                    if *ty == Type::Unknown { return callback(call_args.into_iter(), env) } // Macro
+                    if *ty == Type::SpecialForm { return callback(call_args.into_iter(), env) } // Macro
                     let method_ty = ty.clone().into_method().unwrap();
                     let method_param_tys = method_ty.0;
                     let method_ret_ty = method_ty.1;
@@ -303,7 +306,7 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
     match node.node {
         NodeValue::Bool(_) | NodeValue::Number(_) | NodeValue::String(_) | NodeValue::Keyword(_) | NodeValue::Type(_) | NodeValue::Typed(_, _) => Ok(node),
         NodeValue::Symbol(name) => {
-            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag })?.clone())
+            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag })?.clone())
         },
         NodeValue::List(ref list) => {
             if list.borrow().len() == 0 {

@@ -212,7 +212,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
         NodeValue::Number(_) => Ok(Type::Number),
         NodeValue::String(_) => Ok(Type::String),
         NodeValue::Symbol(name) => {
-            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { span: node.tag.clone() })?.clone())
+            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag.clone() })?.clone())
         },
         NodeValue::Typed(ty, _) => Ok(ty.clone()),
         NodeValue::Type(ty) => Ok(Type::Type(Some(Box::new(ty.clone())))),
@@ -250,7 +250,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                             Ok(Type::UntypedList)
                         }
                     } else {
-                        Err(EvalError::UndefinedVar { span: symbol_node.tag.clone() })
+                        Err(EvalError::UndefinedVar { name: symbol.to_string(), span: symbol_node.tag.clone() })
                     }
                 },
                 Some("struct") => {
@@ -260,8 +260,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     // )))
                     Ok(Type::Type(None))
                 },
-                Some("def") => {
-                    let func = list.next().unwrap();
+                Some("fn") => {
                     let params = list.next().unwrap();
                     let arrow = list.next().unwrap();
                     let ret = list.next().unwrap().clone();//eval(list.next().unwrap().clone(), &ty_env.borrow().static_env)?;
@@ -285,8 +284,16 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                         return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
                     }
 
-                    let func_name = func.as_symbol().unwrap();
                     let method_ty = Type::Method { params: param_tys, ret: Box::new(ret_ty) };
+
+                    Ok(method_ty)
+                },
+                Some("def") => {
+                    let func = list.next().unwrap();
+                    let method = list.next().unwrap();
+
+                    let method_ty = typecheck(method, env)?;
+                    let func_name = func.as_symbol().unwrap();
 
                     if env.borrow().functions.contains_key(func_name) {
                         env.borrow_mut().functions.get_mut(func_name).unwrap().push(method_ty);
@@ -378,9 +385,25 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
                 let func_symbol = list.first().cloned().unwrap();
                 let mut list_iter = list.iter_mut();
                 if let Some(func_symbol) = func_symbol.as_symbol() {
+                    let env_ref = env.borrow();
                     if func_symbol.as_str() == "static" {
                         let val = list_iter.nth(1).unwrap();
+                        drop(env_ref);
                         return eval(val.clone(), env);
+                    } else if let Some(ref node) = env_ref.get(func_symbol) {
+                        if node.ty() == Type::Function {
+                            let methods = node.as_typed().unwrap().1.as_list().unwrap().borrow();
+                            drop(env_ref);
+                            for method in methods.iter().map(|m| m.as_method().unwrap().borrow()) {
+                                match &*method {
+                                    Method::Rust { ty: Type::Macro, callback } => {
+                                        let args = list_iter.skip(1).map(|n| eval_static(n.clone(), env)).collect::<Result<Vec<_>, _>>()?.into_iter();
+                                        return callback(args, env);
+                                    }
+                                    _ => continue
+                                }
+                            }
+                        }
                     }
                 }
                 for elem in list_iter {
@@ -443,7 +466,7 @@ fn main() {
     global_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
     global_env.global_set("String".into(), Node::new_type(Default::default(), Type::String));
     global_env.global_set("Function".into(), Node::new_type(Default::default(), Type::Number));
-    global_env.def_rust_macro("_".into(), Box::new(|args, env| {
+    global_env.def_special_form("_".into(), Box::new(|args, env| {
         let span = args.clone().next().unwrap().tag.clone();
         Ok(Node::new_list(
             span,
@@ -490,7 +513,7 @@ fn main() {
         let b = eval(args.next().unwrap(), env)?;
         Ok(Node::new_bool(Default::default(), a == b))
     }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
-    global_env.def_rust_macro("loop".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("loop".into(), Box::new(|mut args, env| {
         let body = args.next().unwrap();
         loop {
             if let NodeValue::Bool(b) = eval(body.clone(), env)?.node {
@@ -499,7 +522,7 @@ fn main() {
         }
         Ok(Node::new_list(Default::default(), Reference::new(vec![])))
     }));
-    global_env.def_rust_macro("do".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("do".into(), Box::new(|mut args, env| {
         // Create a new scope
         let new_env = Environment::new_child(Rc::clone(env));
         let new_env_rc = Rc::new(RefCell::new(new_env));
@@ -510,10 +533,10 @@ fn main() {
         }
         Ok(res)
     }));
-    global_env.def_rust_macro("quote".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("quote".into(), Box::new(|mut args, env| {
         Ok(args.next().unwrap())
     }));
-    global_env.def_rust_macro("static".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("static".into(), Box::new(|mut args, env| {
         let mut res = Node::new_list(Default::default(), Reference::new(Vec::new()));
 
         if let Some(arg) = args.next() {
@@ -521,7 +544,7 @@ fn main() {
         }
         Ok(res)
     }));
-    global_env.def_rust_macro("get".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("get".into(), Box::new(|mut args, env| {
         let (ty, var) = eval(args.next().unwrap(), env)?.with_type();
         let key = args.next().unwrap();
 
@@ -533,7 +556,7 @@ fn main() {
             panic!("Can only get from table/list objects, got: {var}")
         }
     }));
-    global_env.def_rust_macro("let".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("let".into(), Box::new(|mut args, env| {
         let name = args.next().unwrap();
         let value = eval(args.next().unwrap(), env)?;
         if let NodeValue::Symbol(ref name) = name.node {
@@ -541,7 +564,7 @@ fn main() {
         }
         Ok(name)
     }));
-    global_env.def_rust_macro("set".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("set".into(), Box::new(|mut args, env| {
         let name = args.next().unwrap();
         let value = eval(args.next().unwrap(), env)?;
         if let NodeValue::Symbol(ref name) = name.node {
@@ -549,7 +572,7 @@ fn main() {
         }
         Ok(name)
     }));
-    global_env.def_rust_macro("global-set".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("global-set".into(), Box::new(|mut args, env| {
         let name = args.next().unwrap();
         let value = eval(args.next().unwrap(), env)?;
         if let NodeValue::Symbol(ref name) = name.node {
@@ -557,20 +580,32 @@ fn main() {
         }
         Ok(name)
     }));
-    global_env.def_rust_macro("def".into(), Box::new(|mut args, env| {
+    global_env.def_rust_macro("def!".into(), Box::new(|mut args, env| {
         let name_symbol = args.next().unwrap();
+        let params = args.next().unwrap();
+        let arrow = args.next().unwrap();
+        let ret_ty = eval(args.next().unwrap(), env)?;
+        let block = args.next().unwrap();
 
-        let mut list = vec![Node::new_symbol(Default::default(), "fn".into())];
-        list.extend(args);
+        Ok(Node::new_list(Default::default(), Reference::new(vec![
+            Node::new_symbol(Default::default(), "def".into()),
+            name_symbol, Node::new_list(Default::default(), Reference::new(vec![
+                Node::new_symbol(Default::default(), "fn".into()),
+                params, arrow, ret_ty, block
+            ]))
+        ])))
+    }));
+    global_env.def_special_form("def".into(), Box::new(|mut args, env| {
+        let name_symbol = args.next().unwrap();
+        let method = eval(args.next().unwrap(), env)?;
+        assert!(method.is_method());
 
-        let value = eval(Node::new_list(name_symbol.tag.clone(), Reference::new(list)), env)?;
-        assert!(value.is_method());
         if let NodeValue::Symbol(ref name) = name_symbol.node {
-            env.borrow_mut().global_def(name.clone(), value);
+            env.borrow_mut().global_def(name.clone(), method);
         }
         Ok(name_symbol)
     }));
-    global_env.def_rust_macro("local-def".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("local-def".into(), Box::new(|mut args, env| {
         let name_symbol = args.next().unwrap();
 
         let mut list = vec![Node::new_symbol(Default::default(), "fn".into())];
@@ -583,11 +618,11 @@ fn main() {
         }
         Ok(name_symbol)
     }));
-    global_env.def_rust_macro("call".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("call".into(), Box::new(|mut args, env| {
         let func_symbol = args.next().unwrap();
         Ok(eval_call(func_symbol.clone(), eval(func_symbol, env)?, args, env)?)
     }));
-    global_env.def_rust_macro("fn".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("fn".into(), Box::new(|mut args, env| {
         let params = args.next().unwrap(); // let params = eval(args.next().unwrap(), env)?;
         let arrow = args.next().unwrap();
         arrow.node.as_symbol().filter(|s| **s == "->").ok_or(EvalError::Generic(arrow.tag))?;
@@ -617,7 +652,7 @@ fn main() {
             env: Rc::clone(env), body: Box::new(block), ty: func_ty
         })))
     }));
-    global_env.def_rust_macro("if".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("if".into(), Box::new(|mut args, env| {
         let cond = eval(args.next().unwrap(), env)?;
         let yes = args.next().unwrap();
         let else_symbol = args.next().unwrap();
@@ -658,7 +693,7 @@ fn main() {
             Box::new(ty.into_type().unwrap())
         )))
     }), Type::Method { params: vec![Type::Type], ret: Box::new(Type::Type) });*/
-    global_env.def_rust_macro("imp".into(), Box::new(|mut args, env| {
+    global_env.def_special_form("imp".into(), Box::new(|mut args, env| {
         let mut implementations = Vec::new();
         for elem in args {
             let elem = elem.node.as_list().unwrap();

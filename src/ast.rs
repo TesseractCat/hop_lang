@@ -37,6 +37,9 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Type>
     },
+    Macro,
+    SpecialForm,
+
     Struct(Box<SpanNode>), // Table of field: Type
     Enum(Box<SpanNode>) // Table of Tag: Type
 }

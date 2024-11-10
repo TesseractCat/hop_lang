@@ -19,7 +19,7 @@ let x 0;
 //print (lift (factory 10));
 
 print (test (factory 10) (factory 10));
-//print (test (factory 10) 10);
+print (test 10 10);
 //liftmore (factory 10)
 
 //Let's say we've got a function `lift`. We will iterate through all methods of that function.

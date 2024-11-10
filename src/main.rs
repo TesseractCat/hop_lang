@@ -397,8 +397,9 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
                             for method in methods.iter().map(|m| m.as_method().unwrap().borrow()) {
                                 match &*method {
                                     Method::Rust { ty: Type::Macro, callback } => {
-                                        let args = list_iter.skip(1).map(|n| eval_static(n.clone(), env)).collect::<Result<Vec<_>, _>>()?.into_iter();
-                                        return callback(args, env);
+                                        //let args = list_iter.skip(1).map(|n| eval_static(n.clone(), env)).collect::<Result<Vec<_>, _>>()?.into_iter();
+                                        let args = list_iter.skip(1).map(|n| n.clone()).collect::<Vec<_>>().into_iter();
+                                        return eval_static(callback(args, env)?, env);
                                     }
                                     _ => continue
                                 }
@@ -466,6 +467,8 @@ fn main() {
     global_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
     global_env.global_set("String".into(), Node::new_type(Default::default(), Type::String));
     global_env.global_set("Function".into(), Node::new_type(Default::default(), Type::Number));
+
+    // Special forms
     global_env.def_special_form("_".into(), Box::new(|args, env| {
         let span = args.clone().next().unwrap().tag.clone();
         Ok(Node::new_list(
@@ -473,46 +476,6 @@ fn main() {
             Reference::new(args.map(|arg| eval(arg, env)).collect::<Result<Vec<_>, _>>()?)
         ))
     }));
-    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
-        let a = args.next().unwrap().into_string()
-            .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
-        let b = args.next().unwrap().into_string()
-            .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
-        Ok(Node::new_string(Default::default(), (a.to_string() + b.as_str()).into()))
-    }), Type::Method { params: vec![Type::String, Type::String], ret: Box::new(Type::String) });
-    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
-        let a = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        let b = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        Ok(Node::new_number(Default::default(), a + b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("-".into(), Box::new(|mut args, env| {
-        let a = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        let b = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        Ok(Node::new_number(Default::default(), a - b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("lt".into(), Box::new(|mut args, env| {
-        let a = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        let b = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        Ok(Node::new_bool(Default::default(), a < b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("=".into(), Box::new(|mut args, env| {
-        let a = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        let b = args.next().unwrap().into_number()
-            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
-        Ok(Node::new_bool(Default::default(), a == b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
-    global_env.def_rust_method("refeq".into(), Box::new(|mut args, env| {
-        let a = eval(args.next().unwrap(), env)?;
-        let b = eval(args.next().unwrap(), env)?;
-        Ok(Node::new_bool(Default::default(), a == b))
-    }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
     global_env.def_special_form("loop".into(), Box::new(|mut args, env| {
         let body = args.next().unwrap();
         loop {
@@ -579,21 +542,6 @@ fn main() {
             env.borrow_mut().global_set(name.clone(), value);
         }
         Ok(name)
-    }));
-    global_env.def_rust_macro("def!".into(), Box::new(|mut args, env| {
-        let name_symbol = args.next().unwrap();
-        let params = args.next().unwrap();
-        let arrow = args.next().unwrap();
-        let ret_ty = eval(args.next().unwrap(), env)?;
-        let block = args.next().unwrap();
-
-        Ok(Node::new_list(Default::default(), Reference::new(vec![
-            Node::new_symbol(Default::default(), "def".into()),
-            name_symbol, Node::new_list(Default::default(), Reference::new(vec![
-                Node::new_symbol(Default::default(), "fn".into()),
-                params, arrow, ret_ty, block
-            ]))
-        ])))
     }));
     global_env.def_special_form("def".into(), Box::new(|mut args, env| {
         let name_symbol = args.next().unwrap();
@@ -664,6 +612,75 @@ fn main() {
             Ok(eval(no, env)?)
         }
     }));
+    global_env.def_special_form("imp".into(), Box::new(|mut args, env| {
+        let mut implementations = Vec::new();
+        for elem in args {
+            let elem = elem.node.as_list().unwrap();
+            let elem = elem.borrow();
+
+            let func_name = elem[0].node.as_symbol().unwrap().clone();
+            let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
+                if e.is_symbol() && e.node.as_symbol().unwrap().starts_with("_") {
+                    let placeholder_name = e.node.as_symbol().unwrap().split_at(1).1;
+                    Ok(Type::Placeholder(if placeholder_name.len() == 0 { None } else { Some(placeholder_name.into()) }))
+                } else {
+                    Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
+                }
+            }).collect::<Result<_, _>>()?;
+            let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
+
+            let imp = Implementation {
+                func: func_name,
+                params: param_types,
+                ret: Box::new(ret_type)
+            };
+            implementations.push(imp);
+        }
+        println!("Implements {:?}", implementations);
+        Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
+    }));
+
+    // Methods
+    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
+        let a = args.next().unwrap().into_string()
+            .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
+        let b = args.next().unwrap().into_string()
+            .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
+        Ok(Node::new_string(Default::default(), (a.to_string() + b.as_str()).into()))
+    }), Type::Method { params: vec![Type::String, Type::String], ret: Box::new(Type::String) });
+    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
+        let a = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        let b = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        Ok(Node::new_number(Default::default(), a + b))
+    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    global_env.def_rust_method("-".into(), Box::new(|mut args, env| {
+        let a = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        let b = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        Ok(Node::new_number(Default::default(), a - b))
+    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    global_env.def_rust_method("lt".into(), Box::new(|mut args, env| {
+        let a = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        let b = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        Ok(Node::new_bool(Default::default(), a < b))
+    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    global_env.def_rust_method("=".into(), Box::new(|mut args, env| {
+        let a = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        let b = args.next().unwrap().into_number()
+            .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
+        Ok(Node::new_bool(Default::default(), a == b))
+    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
+    global_env.def_rust_method("refeq".into(), Box::new(|mut args, env| {
+        let a = eval(args.next().unwrap(), env)?;
+        let b = eval(args.next().unwrap(), env)?;
+        Ok(Node::new_bool(Default::default(), a == b))
+    }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
     let out = Rc::new(RefCell::new(BufWriter::new(std::io::stdout())));
     global_env.def_rust_method("print".into(), Box::new(move |mut args, env| {
         let value = args.next().unwrap();
@@ -693,32 +710,46 @@ fn main() {
             Box::new(ty.into_type().unwrap())
         )))
     }), Type::Method { params: vec![Type::Type], ret: Box::new(Type::Type) });*/
-    global_env.def_special_form("imp".into(), Box::new(|mut args, env| {
-        let mut implementations = Vec::new();
-        for elem in args {
-            let elem = elem.node.as_list().unwrap();
-            let elem = elem.borrow();
 
-            let func_name = elem[0].node.as_symbol().unwrap().clone();
-            let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
-                if e.is_symbol() && e.node.as_symbol().unwrap().starts_with("_") {
-                    let placeholder_name = e.node.as_symbol().unwrap().split_at(1).1;
-                    Ok(Type::Placeholder(if placeholder_name.len() == 0 { None } else { Some(placeholder_name.into()) }))
-                } else {
-                    Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
-                }
-            }).collect::<Result<_, _>>()?;
-            let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
+    // Macros
+    global_env.def_rust_macro("def!".into(), Box::new(|mut args, env| {
+        let name_symbol = args.next().unwrap();
+        let params = args.next().unwrap();
+        let arrow = args.next().unwrap();
+        let ret_ty = eval(args.next().unwrap(), env)?;
+        let block = args.next().unwrap();
 
-            let imp = Implementation {
-                func: func_name,
-                params: param_types,
-                ret: Box::new(ret_type)
-            };
-            implementations.push(imp);
+        if let NodeValue::Table(ref table) = params.node {
+            table.borrow_mut().values_mut().for_each(|val| {
+                let mut tmp = Node::new_bool(Default::default(), false);
+                mem::swap(val, &mut tmp);
+                let mut new_val = Node::new_list(Default::default(), Reference::new(vec![
+                    Node::new_symbol(Default::default(), "static".into()),
+                    tmp
+                ]));
+                mem::swap(val, &mut new_val);
+            });
         }
-        println!("Implements {:?}", implementations);
-        Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
+
+        Ok(Node::new_list(Default::default(), Reference::new(vec![
+            Node::new_symbol(Default::default(), "def".into()),
+            name_symbol, Node::new_list(Default::default(), Reference::new(vec![
+                Node::new_symbol(Default::default(), "fn".into()),
+                params, arrow, ret_ty, block
+            ]))
+        ])))
+    }));
+    global_env.def_rust_macro("new!".into(), Box::new(|mut args, env| {
+        let ty = args.next().unwrap();
+        let val = args.next().unwrap();
+
+        Ok(Node::new_list(Default::default(), Reference::new(vec![
+            Node::new_list(Default::default(), Reference::new(vec![
+                Node::new_symbol(Default::default(), "static".into()),
+                ty
+            ])),
+            val
+        ])))
     }));
 
     let global_env_rc = Rc::new(RefCell::new(global_env));

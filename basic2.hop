@@ -2,16 +2,16 @@ static {
     global-set Dumbell (struct [
         weight: Number
     ]);
-    def eq [x: Number, y: Number] -> Bool { = x y };
-    def eq [x: static Dumbell, y: static Dumbell] -> (static Bool) { = x.weight y.weight };
-    def lift [x: static Dumbell] -> (static String) { "meow" };
-    def lift [x: static Dumbell] -> (static Number) { x.weight };
-    def liftmore [x: static Dumbell] -> (static Number) { x.weight };
+    def! eq [x: Number, y: Number] -> Bool { = x y };
+    def! eq [x: Dumbell, y: Dumbell] -> Bool { = x.weight y.weight };
+    def! lift [x: Dumbell] -> String { "meow" };
+    def! lift [x: Dumbell] -> Number { x.weight };
+    def! liftmore [x: Dumbell] -> Number { x.weight };
     
-    def test [x: imp (eq _a _a -> Bool), y: imp (eq _a _a -> Bool)] -> Bool { eq x y };
+    def! test [x: imp (eq _a _a -> Bool), y: imp (eq _a _a -> Bool)] -> Bool { eq x y };
 };
-def factory [weight: static Number] -> (static (imp (lift _ -> Number) (eq _ _ -> Bool))) {
-    ((static Dumbell) [weight: (+ weight 9)])
+def! factory [weight: Number] -> (imp (lift _ -> Number) (eq _ _ -> Bool)) {
+    (new! Dumbell [weight: (+ weight 9)])
 };
 print "LIFTING";
 let x 0;

@@ -173,9 +173,10 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         let methods: Vec<Reference<Method>> = methods.borrow().iter().cloned().map(|m| m.into_method().unwrap()).collect();
         
         let is_special_form = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::SpecialForm, .. })).unwrap_or_default();
+        let is_macro = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::Macro, .. })).unwrap_or_default();
         let (call_tys, call_args): (Vec<_>, Vec<_>) =
             args.map(|arg| {
-                if is_special_form {
+                if is_special_form || is_macro {
                     Ok((arg.ty(), arg))
                 } else {
                     let evaled = eval(arg, env)?;
@@ -234,6 +235,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                 },
                 Method::Rust { callback, ty } => {
                     if *ty == Type::SpecialForm { return callback(call_args.into_iter(), env) } // Macro
+                    if *ty == Type::Macro { return eval(callback(call_args.into_iter(), env)?, env) } // Macro
                     let method_ty = ty.clone().into_method().unwrap();
                     let method_param_tys = method_ty.0;
                     let method_ret_ty = method_ty.1;

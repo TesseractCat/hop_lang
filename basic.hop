@@ -5,7 +5,7 @@ static {
     //def identitytwo (fn [x: 'a] -> 'a { x });
     //print (imp + Number Number -> Number);
     def identity (fn [x: 'a] -> 'a { x });
-    def addone (fn [w: 'x, x: 'x (imp identity ('x (imp + 'x Number -> Number)) -> 'x)] -> 'x { + x 1 });
+    def addone (fn [w: 'x, x: 'x (imp identity ('x (imp + Number Number -> 'x)) -> 'x)] -> 'x { + x 1 });
 };
-print (addone "wow" "meow");
+print (addone "a" "test");
 //identity 'x

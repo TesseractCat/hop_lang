@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use logos::{Logos, Span};
 use smol_str::SmolStr;
 use thiserror::Error;
-use std::{cell::RefCell, collections::HashMap, env, fs, hash::{DefaultHasher, Hash, Hasher}, io::BufWriter, mem, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, env, fs, hash::{DefaultHasher, Hash, Hasher}, io::BufWriter, iter, mem, rc::Rc};
 
 mod tokenize;
 use tokenize::{parse_block, Token};
@@ -151,6 +151,7 @@ fn add_match_constraints(
     type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
     name: &str,
     call_tys: &[Type],
+    call_ret_ty: Option<&Type>,
     inside_method: Option<Var>,
     env: &TypeEnvironment
 ) -> (HashMap<Var, Type>, Var) {
@@ -189,11 +190,20 @@ fn add_match_constraints(
 
     // Link parameters
     for (&mvar, method) in &method_vars {
-        let (param_tys, _) = method.as_method().unwrap();
+        let (param_tys, ret_ty) = method.as_method().unwrap();
         let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
 
-        for (i, param_ty) in param_tys.iter().enumerate() {
-            let actual = &call_tys[i]; // The argument to the function
+        for (i, param_ty) in param_tys.iter().chain(iter::once(&**ret_ty)).enumerate() {
+            let actual = if i == call_tys.len() {
+                if let Some(ref ret_ty) = call_ret_ty {
+                    ret_ty
+                } else {
+                    // If we aren't provided a return type, skip it
+                    continue;
+                }
+            } else {
+                &call_tys[i]
+            }; // The argument to the function
 
             match (param_ty, actual) {
                 (Type::TypeVariable { id: type_var_name, implements }, concrete) |
@@ -235,6 +245,7 @@ fn add_match_constraints(
                                 type_variables,
                                 &imp.func,
                                 &imp.params,
+                                Some(&*imp.ret),
                                 if type_var_is_param { Some(mvar) } else { inside_method },
                                 env
                             ).1;
@@ -267,6 +278,7 @@ fn add_match_constraints(
                                     type_variables,
                                     &imp.func,
                                     &imp.params,
+                                    Some(&*imp.ret),
                                     if type_var_is_param { Some(mvar) } else { inside_method },
                                     env
                                 ).1;
@@ -342,6 +354,7 @@ pub fn typecheck_call(
         &mut type_variables,
         func,
         &call_tys,
+        None,
         None,
         &*env_borrow
     );

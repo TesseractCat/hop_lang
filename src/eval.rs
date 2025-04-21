@@ -11,6 +11,8 @@ use crate::ast::{Callback, Method, Node, NodeValue, Reference, SpanNode, Type};
 pub enum EvalError {
     #[error("type mismatch: expected type `{expected}` got `{got}`")]
     TypeMismatch { expected: String, got: Type, span: Span },
+    #[error("expected additional field")]
+    ExpectedAdditionalField { span: Span },
     #[error("got unexpected field `{got}` when creating struct instance")]
     UnexpectedField { got: String, span: Span },
     #[error("could not find method match")]
@@ -26,6 +28,7 @@ impl EvalError {
     pub fn span(&self) -> Span {
         match self {
             Self::TypeMismatch { span, .. } |
+            Self::ExpectedAdditionalField { span, .. } |
             Self::UnexpectedField { span, .. } |
             Self::NoMethodMatches { span, .. } |
             Self::CalledNonFunc { span, .. } |
@@ -297,7 +300,22 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
             },
             Type::String => {
                 Ok(args.next().unwrap())
-            }
+            },
+            Type::TypeVariable { id, implements } => {
+                assert!(implements.is_none());
+                let imp_list: Vec<SpanNode> = args.map(|arg| eval(arg, env)).collect::<Result<_, _>>()?;
+                for imp in &imp_list {
+                    assert!(imp.is_implementation());
+                }
+                let imp_list = Node::new_typed(
+                    func.tag.clone(), Type::List(Box::new(Type::Implementation)),
+                    SpanNode::new_list(func.tag.clone(), Reference::new(imp_list))
+                );
+                Ok(SpanNode::new_type(func.tag, Type::TypeVariable {
+                    id,
+                    implements: Some(Box::new(imp_list))
+                }))
+            },
             _ => todo!()
         }
     } else {

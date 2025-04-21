@@ -1,2 +1,11 @@
-print (fn [x: static Number, y: static Number] -> (static Bool) { = x y });
-def! eq [x: static Number, y: static Number] -> (static Bool) { = x y };
+static {
+    //def! test [x: imp (+ '_ '_ -> 'out), y: imp (+ '_ '_ -> 'out)] -> 'out { + x y };
+    //def! bar [x: imp (foo _ ? -> 'c)] -> 'c { x };
+    //def! identity [x: 'a] -> 'a { x };
+    //def identitytwo (fn [x: 'a] -> 'a { x });
+    //print (imp + Number Number -> Number);
+    def identity (fn [x: 'a] -> 'a { x });
+    def addone (fn [w: 'x, x: 'x (imp identity ('x (imp + 'x Number -> Number)) -> 'x)] -> 'x { + x 1 });
+};
+print (addone "wow" "meow");
+//identity 'x

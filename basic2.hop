@@ -11,7 +11,7 @@ static {
     def! test [x: imp (eq _a _a -> Bool), y: imp (eq _a _a -> Bool)] -> Bool { eq x y };
 };
 def! factory [weight: Number] -> (imp (lift _ -> Number) (eq _ _ -> Bool)) {
-    (new! Dumbell [weight: (+ weight 9)])
+    new! Dumbell [weight: (+ weight 9)]
 };
 print "LIFTING";
 let x 0;

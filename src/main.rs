@@ -1,10 +1,11 @@
+use batsat::{lbool, BasicSolver, Lit, SolverInterface, Var};
 use codespan_reporting::{diagnostic::{Diagnostic, Label}, files::SimpleFiles, term::termcolor::{ColorChoice, StandardStream}};
 use eval::{Environment, EvalError};
 use indexmap::IndexMap;
 use logos::{Logos, Span};
 use smol_str::SmolStr;
 use thiserror::Error;
-use std::{cell::RefCell, collections::HashMap, env, fs, io::BufWriter, mem, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, env, fs, hash::{DefaultHasher, Hash, Hasher}, io::BufWriter, mem, rc::Rc};
 
 mod tokenize;
 use tokenize::{parse_block, Token};
@@ -141,65 +142,251 @@ impl TypeEnvironment {
     }
 }
 
-pub fn typecheck_call(func_symbol: &SpanNode, func: &str, mut args: impl Iterator<Item=Type>, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError>
-{
-    let env = env.borrow();
-    let call_tys: Vec<_> = args.collect();
-    if let Some(methods) = env.get_function(&func.into()) {
-        let get_methods = |func: &str| -> Option<Vec<Type>> {
-            Some(env.functions.get(&SmolStr::from(func))?.clone())
-        };
+/// Recursively build SAT constraints to select exactly one implementation of `name`
+/// that takes as input the provided `call_tys`.
+/// Returns a map of method vars to their Types, and a fresh `sat_var`
+/// that is true iff some implementation holds.
+fn add_match_constraints(
+    solver: &mut BasicSolver,
+    type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
+    name: &str,
+    call_tys: &[Type],
+    inside_method: Option<Var>,
+    env: &TypeEnvironment
+) -> (HashMap<Var, Type>, Var) {
+    println!("{name} | {call_tys:?}");
+    // Gather candidate methods
+    let methods = env
+        .get_function(&name.into())
+        .unwrap_or(Vec::new())
+        .into_iter()
+        // filter by arity
+        .filter(|m| m.as_method().unwrap().0.len() == call_tys.len())
+        .collect::<Vec<_>>();
+    if methods.is_empty() {
+        let sat_var = solver.new_var_default();
+        solver.add_clause_reuse(&mut vec![Lit::new(sat_var, false)]);
+        return (HashMap::new(), sat_var);
+    }
 
-        let is_macro = methods.first().map(|m| matches!(m, Type::Unknown)).unwrap_or_default();
+    // Create a SAT var per candidate
+    let mut method_vars: HashMap<Var, Type> = HashMap::new();
+    for method in &methods {
+        let v = solver.new_var_default();
+        method_vars.insert(v, method.clone());
+    }
 
-        if is_macro {
-            panic!("Encountered macro {func_symbol}. Macros must be implemented earlier in the typecheck process");
+    // Exactly-one: OR(vars) and pairwise exclusion
+    solver.add_clause_reuse(
+        &mut method_vars.keys().copied().map(|v| Lit::new(v, true)).collect()
+    );
+    let vars: Vec<Var> = method_vars.keys().copied().collect();
+    for i in 0..vars.len() {
+        for j in (i+1)..vars.len() {
+            solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
         }
-    
-        'incompatible: for method in methods {
-            let method_ty = method.as_method().unwrap();
-            let method_param_tys = method_ty.0;
-            let method_ret_ty = method_ty.1;
-            let param_count = method_param_tys.len();
-    
-            let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
+    }
 
-            for (i, (lhs, rhs)) in method_param_tys.iter().zip(&call_tys).enumerate() {
-                // First check if this type can be used with the function we're calling right now
-                if let Type::Implements(implementations) = rhs {
-                    let mut compatible = false;
-                    for imp in implementations {
-                        if imp.func == func && imp.ret == *method_ret_ty {
-                            if let Type::Placeholder(ref placeholder) = imp.params[i] {
-                                // Keep track of placeholders
-                                // FIXME: Need seperate dict for these placeholders?
-                                if let Some(placeholder) = placeholder {
-                                    if let Some(match_ty) = placeholder_matches.get(placeholder) {
-                                        if rhs == match_ty {
-                                            compatible = true;
-                                        }
-                                    } else {
-                                        placeholder_matches.insert(placeholder.clone(), rhs.clone());
-                                    }
-                                } else {
-                                    compatible = true;
-                                }
+    // Link parameters
+    for (&mvar, method) in &method_vars {
+        let (param_tys, _) = method.as_method().unwrap();
+        let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
+
+        for (i, param_ty) in param_tys.iter().enumerate() {
+            let actual = &call_tys[i]; // The argument to the function
+
+            match (param_ty, actual) {
+                (Type::TypeVariable { id: type_var_name, implements }, concrete) |
+                (concrete, Type::TypeVariable { id: type_var_name, implements })
+                if !matches!(concrete, Type::TypeVariable { .. })
+                => {
+                    let type_var_is_param = matches!(param_ty, Type::TypeVariable { .. });
+                    println!("TVUS {type_var_name} = {concrete}");
+
+                    // let mut hasher = DefaultHasher::new();
+                    // inside_method.unwrap_or(mvar).hash(&mut hasher);
+                    // type_var_name.hash(&mut hasher);
+                    // let type_var_id = hasher.finish();
+                    let v = inside_method.unwrap_or(mvar);
+                    let type_var_id = format!("{type_var_name}__{v:?}").into();
+
+                    // Bind the type variable to this concrete type under this method
+                    let var_map = type_variables
+                        .entry(type_var_id)
+                        .or_insert_with(HashMap::new);
+                    let bind_var = var_map
+                        .entry(concrete.clone())
+                        .or_insert_with(|| solver.new_var_default());
+                    // m -> binding_is_ty
+                    solver.add_clause_reuse(&mut vec![
+                        Lit::new(mvar, false),
+                        Lit::new(*bind_var, true),
+                    ]);
+                    // For all constraints on this type variable, recursively handle
+                    // m -> type_var_constraints_satisfied
+                    if let Some(implements_node) = implements {
+                        let (_, list) = implements_node.as_typed().unwrap();
+                        let implements = list.as_list().unwrap().borrow();
+                        let implements = implements.iter().map(|i| i.as_implementation().unwrap());
+                        for imp in implements {
+                            println!("RECURSING {}", imp.func);
+                            let nested = add_match_constraints(
+                                solver,
+                                type_variables,
+                                &imp.func,
+                                &imp.params,
+                                if type_var_is_param { Some(mvar) } else { inside_method },
+                                env
+                            ).1;
+                            // Require: if this method is chosen then nested must hold
+                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
+                        }
+                    }
+                },
+                (
+                    Type::TypeVariable { id: type_var_lhs, implements: implements_lhs },
+                    Type::TypeVariable { id: type_var_rhs, implements: implements_rhs }
+                ) => {
+                    let type_var_id_lhs: SmolStr = format!("{type_var_lhs}__{mvar:?}").into();
+                    let type_var_id_rhs: SmolStr = format!("{type_var_rhs}__{:?}", inside_method.unwrap()).into();
+                    
+                    // m -> unify lhs and rhs
+                    unify_pairs.push((type_var_id_lhs, type_var_id_rhs));
+
+                    // Recurse for implementations
+                    for (i, implements) in [implements_lhs, implements_rhs].into_iter().enumerate() {
+                        let type_var_is_param = i == 0;
+                        if let Some(implements_node) = implements {
+                            let (_, list) = implements_node.as_typed().unwrap();
+                            let implements = list.as_list().unwrap().borrow();
+                            let implements = implements.iter().map(|i| i.as_implementation().unwrap());
+                            for imp in implements {
+                                println!("RECURSING {}", imp.func);
+                                let nested = add_match_constraints(
+                                    solver,
+                                    type_variables,
+                                    &imp.func,
+                                    &imp.params,
+                                    if type_var_is_param { Some(mvar) } else { inside_method },
+                                    env
+                                ).1;
+                                // Require: if this method is chosen then nested must hold
+                                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
                             }
                         }
                     }
-                    if compatible { continue; }
                 }
-                // Otherwise check for argument compatibility
-                if lhs.compatible(rhs, &get_methods, &mut placeholder_matches) {
-                    continue;
+                (lhs, rhs) => {
+                    // Exclude mismatched concrete types
+                    // FIXME: Probably should use .compatible rather than != here?
+                    if lhs != rhs {
+                        // Exclude this method
+                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                    }
                 }
-                // If neither, it's incompatible
-                println!("    - {lhs} not compatible with {rhs}");
-                continue 'incompatible;
             }
-            return Ok(*method_ret_ty.clone());
+        }
+
+        // Unify all pairs under m
+        println!("UNIFYING {unify_pairs:?}");
+        for (lhs_id, rhs_id) in &unify_pairs {
+            let mut lhs_map = type_variables.remove(lhs_id).unwrap_or(HashMap::new());
+            let mut rhs_map = type_variables.remove(rhs_id).unwrap_or(HashMap::new());
+
+            let mut all_tys: std::collections::HashSet<Type> = lhs_map.keys().cloned().collect();
+            all_tys.extend(rhs_map.keys().cloned());
+
+            for ty in all_tys {
+                println!(" - {ty}");
+                let var_lhs = lhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
+                let var_rhs = rhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
+                // Enforce equivalence under mvar: var_lhs <-> var_rhs
+                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_lhs, false), Lit::new(*var_rhs, true)]);
+                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_rhs, false), Lit::new(*var_lhs, true)]);
+            }
+
+            type_variables.insert(lhs_id.clone(), lhs_map);
+            type_variables.insert(rhs_id.clone(), rhs_map);
         }
     }
+
+    // SAT var for "some method holds"
+    let sat_var = solver.new_var_default();
+    // sat_var -> OR(method_vars)
+    let mut or_clause = method_vars.keys().copied()
+        .map(|v| Lit::new(v, true)).collect::<Vec<_>>();
+    or_clause.push(Lit::new(sat_var, false));
+    solver.add_clause_reuse(&mut or_clause);
+    // each method_var -> sat_var
+    for &v in method_vars.keys() {
+        solver.add_clause_reuse(&mut vec![Lit::new(v, false), Lit::new(sat_var, true)]);
+    }
+
+    (method_vars, sat_var)
+}
+
+pub fn typecheck_call(
+    func_symbol: &SpanNode,
+    func: &str,
+    args: impl Iterator<Item = Type>,
+    env: &Rc<RefCell<TypeEnvironment>>
+) -> Result<Type, EvalError> {
+    let call_tys: Vec<_> = args.collect();
+    let env_borrow = env.borrow();
+    let mut solver = BasicSolver::default();
+    let mut type_variables = HashMap::new();
+
+    // Build constraints for `func` just like an `imp` resolution
+    let (method_vars, sat) = add_match_constraints(
+        &mut solver,
+        &mut type_variables,
+        func,
+        &call_tys,
+        None,
+        &*env_borrow
+    );
+
+    // XOR(type variable bindings)
+    for tv_vars in type_variables.values().map(|v| v.values()) {
+        solver.add_clause_reuse(
+            &mut tv_vars.clone().copied().map(|v| Lit::new(v, true)).collect()
+        );
+        let vars: Vec<Var> = tv_vars.copied().collect();
+        for i in 0..vars.len() {
+            for j in (i+1)..vars.len() {
+                solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
+            }
+        }
+    }
+
+    // Solve requiring that some method holds
+    solver.solve_limited(&[Lit::new(sat, true)]);
+
+    // Extract chosen method
+    let (chosen_method_var, chosen_method_ty) =
+        method_vars.into_iter().find(|(m, _)| solver.value_var(*m) == lbool::TRUE)
+        .ok_or(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })?;
+
+    // Extract type variable assignments
+    let mut concrete_type_variables = HashMap::new();
+    println!("{type_variables:?}");
+    for (tvname, tvmap) in type_variables {
+        for (ty, tyvar) in tvmap {
+            println!("{tyvar:?} = {:?}", solver.value_var(tyvar));
+            if solver.value_var(tyvar) == lbool::TRUE {
+                if let Some(existing_ty) = concrete_type_variables.get(&tvname) {
+                    assert_eq!(existing_ty, &ty);
+                } else {
+                    concrete_type_variables.insert(tvname.clone(), ty.clone());
+                }
+            }
+        }
+    }
+
+    println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
+
+    return Ok(chosen_method_ty);
+
     Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
 }
 
@@ -232,16 +419,21 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     Ok(last)
                 },
                 Some("let") => {
-                    let symbol = list.next().unwrap().node.as_symbol().unwrap();
-                    let val = list.next().unwrap();
+                    let symbol_node = list.next()
+                        .ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
+                    let symbol = symbol_node.node.as_symbol()
+                        .ok_or(EvalError::TypeMismatch { expected: "Symbol".into(), got: symbol_node.ty(), span: symbol_node.tag.clone() })?;
+                    let val = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
                     let val_ty = typecheck(val, env)?;
                     env.borrow_mut().set(symbol.clone(), val_ty, true);
                     Ok(Type::UntypedList)
                 },
                 Some("set") => {
-                    let symbol_node = list.next().unwrap();
-                    let symbol = symbol_node.node.as_symbol().unwrap();
-                    let val = list.next().unwrap();
+                    let symbol_node = list.next()
+                        .ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
+                    let symbol = symbol_node.node.as_symbol()
+                        .ok_or(EvalError::TypeMismatch { expected: "Symbol".into(), got: symbol_node.ty(), span: symbol_node.tag.clone() })?;
+                    let val = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
                     if let Some(to_ty) = env.borrow().get(symbol) {
                         let from_ty = typecheck(val, env)?;
                         if from_ty != to_ty {
@@ -254,21 +446,22 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     }
                 },
                 Some("struct") => {
-                    let table = list.next().unwrap();
+                    let table = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
                     // Ok(Type::Type(Box::new(
                     //     Type::Struct(Box::new(table.clone()))
                     // )))
                     Ok(Type::Type(None))
                 },
                 Some("fn") => {
-                    let params = list.next().unwrap();
-                    let arrow = list.next().unwrap();
-                    let ret = list.next().unwrap().clone();//eval(list.next().unwrap().clone(), &ty_env.borrow().static_env)?;
+                    let params = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
+                    let arrow = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
+                    let ret = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
+                    let ret = ret.clone();
 
                     let param_names: Vec<SmolStr> = params.as_table().unwrap().borrow()
                         .keys().cloned().map(|n| n.into_keyword().unwrap()).collect();
                     let param_tys: Vec<Type> = params.as_table().unwrap().borrow().values().map(|v| v.as_type().unwrap().clone()).collect();
-                    let ret_ty = ret.into_type().unwrap();
+                    let ret_ty = ret.into_type().map_err(|e| EvalError::TypeMismatch { expected: "Type".into(), got: e.ty(), span: e.tag })?;
 
                     // Recurse typecheck function body
                     let mut new_env = TypeEnvironment::new_child(Rc::clone(env));
@@ -358,7 +551,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                             _ => todo!("{ty}")
                         }
                     } else {
-                        todo!()
+                        todo!("{first}")
                     }
                 }
             }
@@ -469,7 +662,7 @@ fn main() {
     global_env.global_set("Function".into(), Node::new_type(Default::default(), Type::Number));
 
     // Special forms
-    global_env.def_special_form("_".into(), Box::new(|args, env| {
+    global_env.def_special_form("list".into(), Box::new(|args, env| {
         let span = args.clone().next().unwrap().tag.clone();
         Ok(Node::new_list(
             span,
@@ -603,41 +796,36 @@ fn main() {
     global_env.def_special_form("if".into(), Box::new(|mut args, env| {
         let cond = eval(args.next().unwrap(), env)?;
         let yes = args.next().unwrap();
-        let else_symbol = args.next().unwrap();
-        let no = args.next().unwrap();
+        let mut no = None;
+        if let Some(else_symbol) = args.next() {
+            no = Some(args.next().unwrap());
+        }
 
         if cond.into_bool().unwrap() {
             Ok(eval(yes, env)?)
-        } else {
+        } else if let Some(no) = no {
             Ok(eval(no, env)?)
+        } else {
+            Ok(Node::new_list(Default::default(), Reference::new(vec![])))
         }
     }));
     global_env.def_special_form("imp".into(), Box::new(|mut args, env| {
-        let mut implementations = Vec::new();
-        for elem in args {
-            let elem = elem.node.as_list().unwrap();
-            let elem = elem.borrow();
+        let elem: Vec<SpanNode> = args.collect();
 
-            let func_name = elem[0].node.as_symbol().unwrap().clone();
-            let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
-                if e.is_symbol() && e.node.as_symbol().unwrap().starts_with("_") {
-                    let placeholder_name = e.node.as_symbol().unwrap().split_at(1).1;
-                    Ok(Type::Placeholder(if placeholder_name.len() == 0 { None } else { Some(placeholder_name.into()) }))
-                } else {
-                    Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
-                }
-            }).collect::<Result<_, _>>()?;
-            let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
+        let func_name = elem[0].node.as_symbol().unwrap().clone();
+        let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
+            Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
+        }).collect::<Result<_, _>>()?;
+        let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
 
-            let imp = Implementation {
-                func: func_name,
-                params: param_types,
-                ret: Box::new(ret_type)
-            };
-            implementations.push(imp);
-        }
-        println!("Implements {:?}", implementations);
-        Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
+        let imp = Implementation {
+            func: func_name,
+            params: param_types,
+            ret: Box::new(ret_type)
+        };
+
+        //Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
+        Ok(Node::new_implementation(elem[0].tag.clone(), imp))
     }));
 
     // Methods

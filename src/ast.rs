@@ -16,10 +16,13 @@ pub struct Implementation {
 #[derive(Debug, PartialEq, Eq, Clone, EnumAsInner, Hash)]
 pub enum Type {
     Type(Option<Box<Type>>),
-    Placeholder(Option<SmolStr>),
+    TypeVariable { id: SmolStr, implements: Option<Box<SpanNode>> },
+    Implementation,
+
     Unit,
     Any,
     Unknown,
+
     Symbol,
     Keyword,
     String,
@@ -29,8 +32,7 @@ pub enum Type {
     UntypedList,
     UntypedTable,
     List(Box<Type>),
-    Table(Box<Type>),
-    Implements(Vec<Implementation>),
+    Table(Box<Type>, Box<Type>),
 
     Function, // List of methods
     Method {
@@ -40,8 +42,8 @@ pub enum Type {
     Macro,
     SpecialForm,
 
-    Struct(Box<SpanNode>), // Table of field: Type
-    Enum(Box<SpanNode>) // Table of Tag: Type
+    Struct(Box<SpanNode>), // Table of {Field: Type}
+    Enum(Box<SpanNode>) // Table of {Tag: Type}
 }
 impl Type {
     pub fn compatible(self: &Type, rhs: &Type, get_methods: &impl Fn(&str) -> Option<Vec<Type>>, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
@@ -58,8 +60,7 @@ impl Type {
         match self {
             Self::Any | Self::Unknown => true,
             Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
-            Self::Placeholder(_) => todo!(),
-            Self::Implements(imp_lhs) if matches!(rhs, Self::Implements(_)) => {
+            /*Self::Implements(imp_lhs) if matches!(rhs, Self::Implements(_)) => {
                 if let Self::Implements(imp_rhs) = rhs {
                     // imp_lhs \subseteq imp_rhs
                     // lhs placeholder variables must maintain a mapping to rhs types
@@ -156,7 +157,7 @@ impl Type {
                     if !found_match { return false; }
                 }
                 true
-            },
+            },*/
             Self::UntypedList => match rhs {
                 Self::UntypedList | Self::List(_) => true,
                 _ => false
@@ -167,20 +168,22 @@ impl Type {
 }
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-        // match self {
-        //     Self::Primitive => write!(f, "PRIMITIVE"),
-        //     Self::Struct(structure) => {
-        //         write!(f, "STRUCT[ ")?;
-        //         for (key, value) in structure.iter() {
-        //             key.fmt(f)?;
-        //             write!(f, ": ")?;
-        //             value.fmt(f)?;
-        //             write!(f, " ")?;
-        //         }
-        //         write!(f, "]")
-        //     }
-        // }
+        match self {
+            Type::TypeVariable { id, implements } => {
+                write!(f, "'{id}")?;
+                if let Some(imp) = implements {
+                    write!(f, " | {imp}")?;
+                }
+                Ok(())
+            },
+            Type::Method { params, ret } => {
+                for p in params {
+                    write!(f, "{p} ")?;
+                }
+                write!(f, "-> {ret}")
+            },
+            _ => write!(f, "{self:?}")
+        }
     }
 }
 
@@ -302,6 +305,7 @@ pub enum NodeValue<T: Clone> {
     Symbol(SmolStr),
     String(SmolStr),
     Keyword(SmolStr),
+    TypeVariable(SmolStr),
 
     Bool(bool),
     Number(HashedFloat),
@@ -311,6 +315,7 @@ pub enum NodeValue<T: Clone> {
     Method(Reference<Method>), // Each function is a list of methods (for multiple dispatch)
     Type(Type),
     Typed(Type, Box<Node<T>>), // (Type, Node)
+    Implementation(Implementation) // Implementations are data that can be computed at comptime (i.e. for traits)
 }
 impl<T: Clone> Display for Node<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -321,8 +326,9 @@ impl<T: Clone> Display for NodeValue<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::String(val) => write!(f, r#""{val}""#),
-            Self::Symbol(val) => write!(f, "'{val}"),
+            Self::Symbol(val) => write!(f, "@{val}"),
             Self::Keyword(val) => write!(f, ":{val}"),
+            Self::TypeVariable(val) => write!(f, "'{val}"),
 
             Self::Bool(val) => write!(f, "{val}"),
             Self::Number(val) => write!(f, "{val}"),
@@ -345,6 +351,13 @@ impl<T: Clone> Display for NodeValue<T> {
             Self::Type(ty) => write!(f, "<{ty}>"),
             Self::Typed(ty, node) => {
                 write!(f, "<{ty}>/{node}")
+            },
+            Self::Implementation(Implementation { func, params, ret }) => {
+                write!(f, "[IMP ({func}")?;
+                for p in params.iter() {
+                    write!(f, " {p}")?;
+                }
+                write!(f, ") -> {ret}]")
             }
         }
     }
@@ -380,6 +393,9 @@ impl<T: Clone> Node<T> {
     pub fn new_type(tag: T, ty: Type) -> Self {
         Self { tag, node: NodeValue::Type(ty) }
     }
+    pub fn new_implementation(tag: T, imp: Implementation) -> Self {
+        Self { tag, node: NodeValue::Implementation(imp) }
+    }
 
     pub fn ty(&self) -> Type {
         match &self.node {
@@ -397,6 +413,7 @@ impl<T: Clone> Node<T> {
             NodeValue::Method(m) => match &*m.borrow() {
                 Method::Hop { ty, .. } | Method::Rust { ty, .. } => ty.clone()
             },
+            NodeValue::Implementation(_) => Type::Implementation,
             _ => unimplemented!("ty {self}")
         }
     }

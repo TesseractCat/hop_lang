@@ -43,6 +43,7 @@ print {
 //
 // Hoplang functions can be generic over behaviour. I.e.:
 //  def sort [list: (imp next _ -> (imp cmp _T _T))] -> (imp next _ -> _T) { ... }
+//  def sort [list: (imp next '_ -> (imp cmp 'T 'T))] -> (imp next '_ -> 'T) { ... }
 // This function accepts any type that has a `next` implementation. The `_` symbol
 // marks a placeholder that is filled with the provided type.
 // If a placeholder is named, like `_T`, all instances of the placeholder

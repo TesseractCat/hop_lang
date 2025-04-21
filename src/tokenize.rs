@@ -5,7 +5,7 @@ use logos::{Lexer, Logos, Span};
 use smol_str::SmolStr;
 use thiserror::Error;
 
-use crate::ast::{Node, Reference, SpanNode};
+use crate::ast::{Node, Reference, SpanNode, Type};
 
 #[derive(Error, Debug)]
 pub enum ParseError {
@@ -69,7 +69,7 @@ pub enum Token {
     #[token(",")]
     Comma,
     
-    #[token("'")]
+    //#[token("'")]
     Quote,
 
     #[token("false", |_| false)]
@@ -85,13 +85,18 @@ pub enum Token {
     })]
     String(SmolStr),
 
-    #[regex(r#"[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=!><]*"#, |lex| SmolStr::from(lex.slice()))]
+    #[regex(r#"[a-zA-Z\-\/+=]+[a-zA-Z\-\/+_=!><]*"#, |lex| SmolStr::from(lex.slice()))]
     Symbol(SmolStr),
     #[regex(r#":[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| {
         let m = lex.slice();
         SmolStr::from(&m[1..m.len()])
     })]
     Keyword(SmolStr),
+    #[regex(r#"'[a-zA-Z\-\/+_=><]*"#, |lex| {
+        let m = lex.slice();
+        SmolStr::from(&m[1..m.len()])
+    })]
+    TypeVariable(SmolStr),
 
     // Sugar
     #[regex(r#"\.\("#)]
@@ -191,6 +196,7 @@ pub fn parse_list(lexer: &mut Lexer<'_, Token>, stop_tokens: &[Token]) -> Result
             Token::String(str) => Some(Node::new_string(lexer.span(), str)),
             Token::Symbol(str) => Some(Node::new_symbol(lexer.span(), str)),
             Token::Keyword(str) => Some(Node::new_keyword(lexer.span(), str)),
+            Token::TypeVariable(str) => Some(Node::new_type(lexer.span(), Type::TypeVariable { id: str, implements: None })),
 
             Token::Call => {
                 if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }
@@ -264,6 +270,7 @@ pub fn parse_block(lexer: &mut Lexer<'_, Token>) -> Result<SpanNode, ParseError>
             Token::String(str) => list.push(Node::new_string(lexer.span(), str)),
             Token::Symbol(str) => list.push(Node::new_symbol(lexer.span(), str)),
             Token::Keyword(str) => list.push(Node::new_keyword(lexer.span(), str)),
+            Token::TypeVariable(str) => list.push(Node::new_type(lexer.span(), Type::TypeVariable { id: str, implements: None })),
 
             Token::Call => {
                 if res.len() == 0 { return Err(ParseError::Generic(lexer.span())); }

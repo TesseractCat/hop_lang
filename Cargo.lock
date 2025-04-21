@@ -3,10 +3,25 @@
 version = 3
 
 [[package]]
+name = "batsat"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec82b6bbce8ea42f5003417b699267860a9f4dd869fc9ba8faceac761d5afed1"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
+
+[[package]]
+name = "bit-vec"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f59bbe95d4e52a6398ec21238d31577f2b28a9d86807f06ca59d191d8440d0bb"
 
 [[package]]
 name = "borsh"
@@ -73,6 +88,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hop_lang"
 version = "0.1.0"
 dependencies = [
+ "batsat",
  "codespan-reporting",
  "enum-as-inner",
  "indexmap",

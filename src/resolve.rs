@@ -9,22 +9,21 @@ use crate::{ast::{SpanNode, Type}, eval::EvalError};
 /// that takes as input the provided `call_tys`.
 /// Returns a map of method vars to their Types, and a fresh `sat_var`
 /// that is true iff some implementation holds.
-fn add_match_constraints<'a>(
+fn add_match_constraints<T>(
     solver: &mut BasicSolver,
     type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
     inside_method: Option<(usize, Var)>,
-    get_methods_by_name: &impl Fn(&str) -> Option<&'a [Type]>
-) -> (HashMap<Var, Type>, Var) {
+    get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>
+) -> (HashMap<Var, (Type, T)>, Var) {
     println!("{name} | {call_tys:?} {call_ret_ty:?}");
     // Gather candidate methods
     let methods = get_methods_by_name(name)
-        .unwrap_or(&[])
         .into_iter()
         // filter by arity
-        .filter(|m| m.as_method().unwrap().0.len() == call_tys.len())
+        .filter(|m| m.0.as_method().unwrap().0.len() == call_tys.len())
         .collect::<Vec<_>>();
     if methods.is_empty() {
         let sat_var = solver.new_var_default();
@@ -33,10 +32,10 @@ fn add_match_constraints<'a>(
     }
 
     // Create a SAT var per candidate
-    let mut method_vars: HashMap<Var, Type> = HashMap::new();
+    let mut method_vars: HashMap<Var, (Type, T)> = HashMap::new();
     for method in methods {
         let v = solver.new_var_default();
-        method_vars.insert(v, method.clone());
+        method_vars.insert(v, method);
     }
 
     // Exactly-one: OR(vars) and pairwise exclusion
@@ -51,7 +50,7 @@ fn add_match_constraints<'a>(
     }
 
     // Link parameters
-    for (&mvar, method) in &method_vars {
+    for (&mvar, (method, _)) in &method_vars {
         let (param_tys, ret_ty) = method.as_method().unwrap();
         let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
 
@@ -164,7 +163,7 @@ fn add_match_constraints<'a>(
                 (lhs, rhs) => {
                     // Exclude mismatched concrete types
                     // FIXME: Probably should use .compatible rather than != here?
-                    if lhs != rhs {
+                    if !lhs.compatible(rhs) {
                         // Exclude this method
                         solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                     }
@@ -210,11 +209,17 @@ fn add_match_constraints<'a>(
     (method_vars, sat_var)
 }
 
-pub fn resolve_method<'a>(
+pub struct MethodResolution<T> {
+    pub method_ty: Type,
+    pub ret_ty: Type,
+    pub data: T
+}
+
+pub fn resolve_method<T>(
     func: &SpanNode,
     call_tys: impl Iterator<Item = Type>,
-    get_methods_by_name: impl Fn(&str) -> Option<&'a [Type]>
-) -> Result<Type, EvalError> {
+    get_methods_by_name: impl Fn(&str) -> Vec<(Type, T)>
+) -> Result<MethodResolution<T>, EvalError> {
     let func_name = func.as_symbol().unwrap();
     let call_tys: Vec<_> = call_tys.collect();
     let mut solver = BasicSolver::default();
@@ -267,7 +272,28 @@ pub fn resolve_method<'a>(
         }
     }
 
-    println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
+    let chosen_method = chosen_method_ty.0.as_method().unwrap();
+    let unresolved_ret_ty = (**chosen_method.1).clone();
+    let ret_ty = match unresolved_ret_ty {
+        Type::TypeVariable { id: type_var_name, .. } => {
+            let i = chosen_method.0.len();
+            let type_var_id: SmolStr = if type_var_name == "_" {
+                format!("anon{i}__{chosen_method_var:?}").into()
+            } else {
+                format!("{type_var_name}__{chosen_method_var:?}").into()
+            };
+            // FIXME: If this panics, that means that we haven't resolved the return type
+            concrete_type_variables[&type_var_id].clone()
+        },
+        _ => unresolved_ret_ty
+    };
 
-    Ok(chosen_method_ty)
+    println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
+    println!(" - RETURN TYPE = {ret_ty}");
+
+    Ok(MethodResolution {
+        method_ty: chosen_method_ty.0,
+        data: chosen_method_ty.1,
+        ret_ty: ret_ty,
+    })
 }

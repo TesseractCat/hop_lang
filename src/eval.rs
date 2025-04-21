@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, mem, rc::Rc};
+use std::{cell::{Ref, RefCell}, collections::HashMap, mem, rc::Rc};
 
 use indexmap::IndexMap;
 use logos::Span;
@@ -6,7 +6,7 @@ use slotmap::{new_key_type, SlotMap};
 use smol_str::SmolStr;
 use thiserror::Error;
 
-use crate::ast::{Callback, Method, Node, NodeValue, Reference, SpanNode, Type};
+use crate::{ast::{Callback, Method, Node, NodeValue, Reference, SpanNode, Type}, resolve};
 
 #[derive(Error, Debug)]
 pub enum EvalError {
@@ -165,17 +165,8 @@ pub fn eval_call(
     env: &mut Environment,
     env_key: EnvironmentKey
 ) -> Result<SpanNode, EvalError> {
-    let get_methods = |func: &str| -> Option<Vec<Type>> {
-        let (ty, methods) = env.get(env_key, &func.into())?.clone().with_type();
-        if ty.is_function() {
-            Some(methods.as_list().unwrap().borrow().iter().map(|n| n.ty()).collect())
-        } else {
-            None
-        }
-    };
-
     if func.ty().is_function() {
-        let methods = func.with_type().1.into_list().unwrap();
+        /*let methods = func.with_type().1.into_list().unwrap();
         let methods: Vec<Reference<Method>> = methods.borrow().iter().cloned().map(|m| m.into_method().unwrap()).collect();
         
         let is_special_form = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::SpecialForm, .. })).unwrap_or_default();
@@ -190,10 +181,80 @@ pub fn eval_call(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?
+            .into_iter().unzip();*/
+
+        let (is_special_form, is_macro) = {
+            let (_, methods) = func.as_typed().unwrap();
+            let methods: Vec<Reference<Method>> = methods.as_list().unwrap().borrow().iter().cloned().map(|m| m.as_method().unwrap().cloned()).collect();
+            
+            let is_special_form = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::SpecialForm, .. })).unwrap_or_default();
+            let is_macro = methods.first().map(|m| matches!(*m.borrow(), Method::Rust { ty: Type::Macro, .. })).unwrap_or_default();
+
+            (is_special_form, is_macro)
+        };
+        let (call_tys, call_args): (Vec<_>, Vec<_>) =
+            args.map(|arg| {
+                if is_special_form || is_macro {
+                    Ok((arg.ty(), arg))
+                } else {
+                    let evaled = eval(arg, env, env_key)?;
+                    Ok::<_, EvalError>((evaled.ty(), evaled))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter().unzip();
 
+        let get_methods = |func: &str| -> Vec<(Type, Reference<Method>)> {
+            if let Some((ty, methods)) = env.get(env_key, &func.into()).cloned().map(|x| x.with_type()) {
+                if ty.is_function() {
+                    let methods = methods.as_list().unwrap().borrow();
+                    return methods.iter().map(|x| (x.ty(), x.as_method().unwrap().cloned())).collect();
+                }
+            }
+            Vec::new()
+        };
+
+        let (method, method_ret_ty) = if is_special_form || is_macro {
+            let (_, methods) = func.as_typed().unwrap();
+            let (method, method_ty) = methods.as_list().unwrap().borrow().iter().cloned()
+                         .map(|m| (m.as_method().unwrap().cloned(), m.ty())).next().unwrap();
+            (method, Type::Unknown)
+        } else {
+            let resolved = resolve::resolve_method(&func_symbol, call_tys.into_iter(), get_methods)?;
+            (resolved.data, resolved.ret_ty)
+        };
+
+        match &*method.borrow() {
+            Method::Hop { param_names, def_env_key, body, ty } => {
+                let method_ty = ty.as_method().unwrap();
+                // Call method
+                // Create a new scope
+                let new_env_key = env.new_child(*def_env_key);
+
+                for (param, arg) in param_names.into_iter().zip(call_args.into_iter()) {
+                    //println!("Setting function env {param} = {arg}");
+                    env.set(new_env_key, param.clone(), arg, true);
+                }
+
+                let res = eval(*body.clone(), env, new_env_key)?;
+                let res_ty = res.ty();
+                return if method_ret_ty.compatible(&res_ty) {
+                    Ok(res)
+                } else {
+                    Err(EvalError::TypeMismatch { expected: format!("{}", method_ret_ty), got: res_ty, span: body.tag.clone() })
+                };
+            },
+            Method::Rust { callback, ty } => {
+                return callback(
+                    call_args.into_iter(),
+                    env,
+                    env_key
+                );
+            }
+        }
+
         //println!("Searching for method match!");
-        for method in methods {
+        /*for method in methods {
             let borrowed = method.borrow();
             match &*borrowed {
                 Method::Hop { param_names, env: env_key, body, ty } => {
@@ -268,7 +329,7 @@ pub fn eval_call(
                     }
                 }
             }
-        }
+        }*/
         return Err(EvalError::NoMethodMatches { span: func_symbol.tag });
     } else if let NodeValue::Type(ty) = func.node {
         // Create type instance

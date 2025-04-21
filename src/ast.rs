@@ -46,7 +46,7 @@ pub enum Type {
     Enum(Box<SpanNode>) // Table of {Tag: Type}
 }
 impl Type {
-    pub fn compatible(self: &Type, rhs: &Type, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
+    pub fn compatible(self: &Type, rhs: &Type) -> bool {
         // Compatibility such that rhs can be used in place of self
 
         // Strict equality
@@ -228,7 +228,7 @@ pub type Callback = dyn Fn(std::vec::IntoIter<SpanNode>, &mut Environment, Envir
 pub enum Method {
     Hop {
         param_names: Vec<SmolStr>,
-        env: EnvironmentKey,
+        def_env_key: EnvironmentKey,
         body: Box<SpanNode>,
         ty: Type
     },

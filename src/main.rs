@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use logos::Logos;
 use slotmap::{new_key_type, SlotMap};
 use smol_str::SmolStr;
-use std::{cell::RefCell, collections::HashMap, env, fs, hash::Hash, io::BufWriter, mem, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, env, fs, hash::Hash, io::BufWriter, iter, mem, rc::Rc};
 
 mod tokenize;
 use tokenize::{parse_block, Token};
@@ -140,10 +140,12 @@ pub fn typecheck_call(
     env: &TypeEnvironment,
     env_key: TypeEnvironmentKey
 ) -> Result<Type, EvalError> {
-    let get_methods_by_name = |name: &str| -> Option<&[Type]> {
-        env.get_function(env_key, &name.into())
+    let get_methods_by_name = |name: &str| -> Vec<(Type, ())> {
+        env.get_function(env_key, &name.into()).unwrap_or(&[])
+            .into_iter().cloned().map(|x| (x, ())).collect()
     };
     resolve::resolve_method(func_symbol, args, get_methods_by_name)
+        .map(|x| x.ret_ty)
 }
 
 fn typecheck(
@@ -222,15 +224,15 @@ fn typecheck(
                     let ret_ty = ret.into_type().map_err(|e| EvalError::TypeMismatch { expected: "Type".into(), got: e.ty(), span: e.tag })?;
 
                     // Recurse typecheck function body
-                    let mut new_env_key = env.new_child(env_key);
+                    let new_env_key = env.new_child(env_key);
                     for (param_name, param_ty) in param_names.iter().zip(param_tys.iter()) {
-                        //println!("Setting function env {param} = {arg}");
+                        //println!("Setting function env {param_name} = {param_ty}");
                         env.set(new_env_key, param_name.clone(), param_ty.clone(), true);
                     }
 
                     let body = list.next().unwrap();
                     let body_ty = typecheck(body, env, new_env_key)?;
-                    if !ret_ty.compatible(&body_ty, &mut Default::default()) {
+                    if !ret_ty.compatible(&body_ty) {
                         return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
                     }
 
@@ -549,7 +551,7 @@ fn main() {
         };
         Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
             param_names: params.keys().cloned().map(|n| n.into_keyword().unwrap()).collect(),
-            env: env_key, body: Box::new(block), ty: func_ty
+            def_env_key: env_key, body: Box::new(block), ty: func_ty
         })))
     }));
     runtime_env.global_def_special_form("if".into(), Box::new(|mut args, env, env_key| {
@@ -631,7 +633,6 @@ fn main() {
     let out = Rc::new(RefCell::new(BufWriter::new(std::io::stdout())));
     runtime_env.global_def_rust_method("print".into(), Box::new(move |mut args, env, env_key| {
         let value = args.next().unwrap();
-        //writeln!(out.borrow_mut(), "{value}");
         println!("{value}");
         Ok(value)
     }), Type::Method { params: vec![Type::Any], ret: Box::new(Type::Any) });

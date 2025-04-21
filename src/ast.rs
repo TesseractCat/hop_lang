@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use logos::Span;
 use smol_str::SmolStr;
 
-use crate::eval::{Environment, EvalError};
+use crate::eval::{Environment, EnvironmentKey, EvalError};
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Implementation {
@@ -46,7 +46,7 @@ pub enum Type {
     Enum(Box<SpanNode>) // Table of {Tag: Type}
 }
 impl Type {
-    pub fn compatible(self: &Type, rhs: &Type, get_methods: &impl Fn(&str) -> Option<Vec<Type>>, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
+    pub fn compatible(self: &Type, rhs: &Type, placeholder_matches: &mut HashMap<SmolStr, Type>) -> bool {
         // Compatibility such that rhs can be used in place of self
 
         // Strict equality
@@ -224,11 +224,11 @@ impl<T> Hash for Reference<T> {
         std::ptr::hash(self.0.as_ptr(), state)
     }
 }
-pub type Callback = dyn Fn(std::vec::IntoIter<SpanNode>, &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError>;
+pub type Callback = dyn Fn(std::vec::IntoIter<SpanNode>, &mut Environment, EnvironmentKey) -> Result<SpanNode, EvalError>;
 pub enum Method {
     Hop {
         param_names: Vec<SmolStr>,
-        env: Rc<RefCell<Environment>>,
+        env: EnvironmentKey,
         body: Box<SpanNode>,
         ty: Type
     },

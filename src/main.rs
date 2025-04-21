@@ -1,11 +1,10 @@
-use batsat::{lbool, BasicSolver, Lit, SolverInterface, Var};
 use codespan_reporting::{diagnostic::{Diagnostic, Label}, files::SimpleFiles, term::termcolor::{ColorChoice, StandardStream}};
-use eval::{Environment, EvalError};
+use eval::{Environment, EnvironmentKey, EvalError};
 use indexmap::IndexMap;
-use logos::{Logos, Span};
+use logos::Logos;
+use slotmap::{new_key_type, SlotMap};
 use smol_str::SmolStr;
-use thiserror::Error;
-use std::{cell::RefCell, collections::HashMap, env, fs, hash::{DefaultHasher, Hash, Hasher}, io::BufWriter, iter, mem, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, env, fs, hash::Hash, io::BufWriter, mem, rc::Rc};
 
 mod tokenize;
 use tokenize::{parse_block, Token};
@@ -13,117 +12,110 @@ mod ast;
 use ast::{Implementation, Method, Node, NodeValue, Reference, SpanNode, Type};
 mod eval;
 use eval::{eval, eval_call};
+mod resolve;
 
+new_key_type! { pub struct TypeEnvironmentKey; }
 #[derive(Default, Debug, PartialEq)]
-pub struct TypeEnvironment {
-    static_env: Rc<RefCell<Environment>>,
+pub struct TypeEnvironmentScope {
+    static_env_key: EnvironmentKey,
     bindings: HashMap<SmolStr, Type>,
     functions: HashMap<SmolStr, Vec<Type>>,
-    up: Option<Rc<RefCell<Self>>>,
-    global: Option<Rc<RefCell<Self>>>
+    up: Option<TypeEnvironmentKey>,
+}
+
+#[derive(Default, Debug)]
+pub struct TypeEnvironment {
+    pub global: TypeEnvironmentKey,
+    static_env: Environment,
+    scopes: SlotMap<TypeEnvironmentKey, TypeEnvironmentScope>
 }
 impl TypeEnvironment {
     pub fn new() -> Self {
-        Self {
-            static_env: Rc::new(RefCell::new(Environment::new())),
+        let static_env = Environment::new();
+        let global_scope = TypeEnvironmentScope {
+            static_env_key: static_env.global,
             ..Default::default()
-        }
+        };
+        let mut scopes = SlotMap::<TypeEnvironmentKey, TypeEnvironmentScope>::with_key();
+        let global_scope_key = scopes.insert(global_scope);
+        Self { global: global_scope_key, static_env, scopes }
     }
 
-    pub fn new_child(this: Rc<RefCell<Self>>) -> Self {
-        let child_static_env = Environment::new_child(this.borrow().static_env.clone());
-        Self {
-            static_env: Rc::new(RefCell::new(child_static_env)),
-            up: Some(Rc::clone(&this)),
-            global: Some(
-                if this.borrow().global.is_some() {
-                    this.borrow().global.clone().unwrap()
-                } else {
-                    this
-                }
-            ),
+    pub fn new_child(&mut self, current: TypeEnvironmentKey) -> TypeEnvironmentKey {
+        let child_static_env_key = self.static_env.new_child(self.scopes[current].static_env_key);
+        let child_scope = TypeEnvironmentScope {
+            static_env_key: child_static_env_key,
+            up: Some(current),
             ..Default::default()
-        }
+        };
+        self.scopes.insert(child_scope)
     }
 
-    pub fn get(&self, name: &SmolStr) -> Option<Type> {
-        if let Some(binding) = self.bindings.get(name) {
-            Some(binding.clone())
-        } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
-            let mut env = up;
-            while env.borrow().bindings.get(name).is_none() {
-                let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
-                if let Some(up) = up {
-                    env = up;
-                } else {
-                    break;
-                }
-            }
-            let r = env.borrow().bindings.get(name).cloned();
-            r
-        } else {
-            None
+    pub fn get(&self, current: TypeEnvironmentKey, name: &SmolStr) -> Option<&Type> {
+        if let Some(binding) = self.scopes.get(current).unwrap().bindings.get(name) {
+            return Some(binding);
         }
-    }
-    pub fn get_function(&self, name: &SmolStr) -> Option<Vec<Type>> {
-        if let Some(binding) = self.functions.get(name) {
-            Some(binding.clone())
-        } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
-            let mut env = up;
-            while env.borrow().functions.get(name).is_none() {
-                let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
-                if let Some(up) = up {
-                    env = up;
-                } else {
-                    break;
-                }
+
+        let mut current = current;
+        while let Some(parent) = self.scopes.get(current).unwrap().up {
+            current = parent;
+            if let Some(binding) = self.scopes.get(current).unwrap().bindings.get(name) {
+                return Some(binding);
             }
-            let r = env.borrow().functions.get(name).cloned();
-            r
-        } else {
-            None
         }
+
+        None
     }
-    pub fn has(&self, name: &SmolStr) -> bool {
-        self.get(name).is_some()
+    pub fn get_function(&self, current: TypeEnvironmentKey, name: &SmolStr) -> Option<&[Type]> {
+        if let Some(binding) = self.scopes.get(current).unwrap().functions.get(name) {
+            return Some(binding);
+        }
+
+        let mut current = current;
+        while let Some(parent) = self.scopes.get(current).unwrap().up {
+            current = parent;
+            if let Some(binding) = self.scopes.get(current).unwrap().functions.get(name) {
+                return Some(binding);
+            }
+        }
+
+        None
     }
-    pub fn set(&mut self, name: SmolStr, value: Type, shadow: bool) {
-        if self.has(&name) && !shadow {
-            if let Some(binding) = self.bindings.get_mut(&name) {
+    pub fn has(&self, current: TypeEnvironmentKey, name: &SmolStr) -> bool {
+        self.get(current, name).is_some()
+    }
+    pub fn set(&mut self, current: TypeEnvironmentKey, name: SmolStr, value: Type, shadow: bool) {
+        if self.has(current, &name) && !shadow {
+            if let Some(binding) = self.scopes.get_mut(current).unwrap().bindings.get_mut(&name) {
                 let _ = mem::replace(binding, value);
-            } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
-                let mut env = up;
-                while env.borrow().bindings.get(&name).is_none() {
-                    let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
-                    if let Some(up) = up {
-                        env = up;
-                    } else {
-                        break;
-                    }
-                }
-                let mut borrow = env.borrow_mut();
-                let binding = borrow.bindings.get_mut(&name);
-                if let Some(binding) = binding {
+                return;
+            }
+
+            let mut current = current;
+            while let Some(parent) = self.scopes.get(current).unwrap().up {
+                current = parent;
+                if let Some(binding) = self.scopes.get_mut(current).unwrap().bindings.get_mut(&name) {
                     let _ = mem::replace(binding, value);
+                    return;
                 }
             }
         } else {
-            self.bindings.insert(name, value.clone());
+            self.scopes.get_mut(current).unwrap().bindings.insert(name, value);
         }
     }
-    pub fn def(&mut self, name: SmolStr, value: Type) {
-        if self.functions.contains_key(&name) {
-            self.functions.get_mut(&name).unwrap().push(value);
+    pub fn def(&mut self, current: TypeEnvironmentKey, name: SmolStr, value: Type) {
+        if self.scopes[current].functions.contains_key(&name) {
+            self.scopes[current].functions.get_mut(&name).unwrap().push(value);
         } else {
-            self.functions.insert(name, vec![value]);
+            self.scopes[current].functions.insert(name, vec![value]);
         }
     }
 
-    pub fn global_get(&mut self, name: &SmolStr) -> Option<Type> {
-        if let Some(ref mut global) = self.global {
-            global.borrow_mut().get(name)
+    /*pub fn global_get(&mut self, current: TypeEnvironmentKey, name: &SmolStr) -> Option<&Type> {
+        if let Some(v) = self.scopes[self.global].bindings.get(name) {
+            Some(v)
         } else {
-            self.get(name)
+            self.get(current, name)
         }
     }
     pub fn global_set(&mut self, name: SmolStr, value: Type) {
@@ -139,280 +131,32 @@ impl TypeEnvironment {
         } else {
             self.def(name, value);
         }
-    }
-}
-
-/// Recursively build SAT constraints to select exactly one implementation of `name`
-/// that takes as input the provided `call_tys`.
-/// Returns a map of method vars to their Types, and a fresh `sat_var`
-/// that is true iff some implementation holds.
-fn add_match_constraints(
-    solver: &mut BasicSolver,
-    type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
-    name: &str,
-    call_tys: &[Type],
-    call_ret_ty: Option<&Type>,
-    inside_method: Option<Var>,
-    env: &TypeEnvironment
-) -> (HashMap<Var, Type>, Var) {
-    println!("{name} | {call_tys:?}");
-    // Gather candidate methods
-    let methods = env
-        .get_function(&name.into())
-        .unwrap_or(Vec::new())
-        .into_iter()
-        // filter by arity
-        .filter(|m| m.as_method().unwrap().0.len() == call_tys.len())
-        .collect::<Vec<_>>();
-    if methods.is_empty() {
-        let sat_var = solver.new_var_default();
-        solver.add_clause_reuse(&mut vec![Lit::new(sat_var, false)]);
-        return (HashMap::new(), sat_var);
-    }
-
-    // Create a SAT var per candidate
-    let mut method_vars: HashMap<Var, Type> = HashMap::new();
-    for method in &methods {
-        let v = solver.new_var_default();
-        method_vars.insert(v, method.clone());
-    }
-
-    // Exactly-one: OR(vars) and pairwise exclusion
-    solver.add_clause_reuse(
-        &mut method_vars.keys().copied().map(|v| Lit::new(v, true)).collect()
-    );
-    let vars: Vec<Var> = method_vars.keys().copied().collect();
-    for i in 0..vars.len() {
-        for j in (i+1)..vars.len() {
-            solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
-        }
-    }
-
-    // Link parameters
-    for (&mvar, method) in &method_vars {
-        let (param_tys, ret_ty) = method.as_method().unwrap();
-        let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
-
-        for (i, param_ty) in param_tys.iter().chain(iter::once(&**ret_ty)).enumerate() {
-            let actual = if i == call_tys.len() {
-                if let Some(ref ret_ty) = call_ret_ty {
-                    ret_ty
-                } else {
-                    // If we aren't provided a return type, skip it
-                    continue;
-                }
-            } else {
-                &call_tys[i]
-            }; // The argument to the function
-
-            match (param_ty, actual) {
-                (Type::TypeVariable { id: type_var_name, implements }, concrete) |
-                (concrete, Type::TypeVariable { id: type_var_name, implements })
-                if !matches!(concrete, Type::TypeVariable { .. })
-                => {
-                    let type_var_is_param = matches!(param_ty, Type::TypeVariable { .. });
-                    println!("TVUS {type_var_name} = {concrete}");
-
-                    // let mut hasher = DefaultHasher::new();
-                    // inside_method.unwrap_or(mvar).hash(&mut hasher);
-                    // type_var_name.hash(&mut hasher);
-                    // let type_var_id = hasher.finish();
-                    let v = inside_method.unwrap_or(mvar);
-                    let type_var_id = format!("{type_var_name}__{v:?}").into();
-
-                    // Bind the type variable to this concrete type under this method
-                    let var_map = type_variables
-                        .entry(type_var_id)
-                        .or_insert_with(HashMap::new);
-                    let bind_var = var_map
-                        .entry(concrete.clone())
-                        .or_insert_with(|| solver.new_var_default());
-                    // m -> binding_is_ty
-                    solver.add_clause_reuse(&mut vec![
-                        Lit::new(mvar, false),
-                        Lit::new(*bind_var, true),
-                    ]);
-                    // For all constraints on this type variable, recursively handle
-                    // m -> type_var_constraints_satisfied
-                    if let Some(implements_node) = implements {
-                        let (_, list) = implements_node.as_typed().unwrap();
-                        let implements = list.as_list().unwrap().borrow();
-                        let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                        for imp in implements {
-                            println!("RECURSING {}", imp.func);
-                            let nested = add_match_constraints(
-                                solver,
-                                type_variables,
-                                &imp.func,
-                                &imp.params,
-                                Some(&*imp.ret),
-                                if type_var_is_param { Some(mvar) } else { inside_method },
-                                env
-                            ).1;
-                            // Require: if this method is chosen then nested must hold
-                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                        }
-                    }
-                },
-                (
-                    Type::TypeVariable { id: type_var_lhs, implements: implements_lhs },
-                    Type::TypeVariable { id: type_var_rhs, implements: implements_rhs }
-                ) => {
-                    let type_var_id_lhs: SmolStr = format!("{type_var_lhs}__{mvar:?}").into();
-                    let type_var_id_rhs: SmolStr = format!("{type_var_rhs}__{:?}", inside_method.unwrap()).into();
-                    
-                    // m -> unify lhs and rhs
-                    unify_pairs.push((type_var_id_lhs, type_var_id_rhs));
-
-                    // Recurse for implementations
-                    for (i, implements) in [implements_lhs, implements_rhs].into_iter().enumerate() {
-                        let type_var_is_param = i == 0;
-                        if let Some(implements_node) = implements {
-                            let (_, list) = implements_node.as_typed().unwrap();
-                            let implements = list.as_list().unwrap().borrow();
-                            let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                            for imp in implements {
-                                println!("RECURSING {}", imp.func);
-                                let nested = add_match_constraints(
-                                    solver,
-                                    type_variables,
-                                    &imp.func,
-                                    &imp.params,
-                                    Some(&*imp.ret),
-                                    if type_var_is_param { Some(mvar) } else { inside_method },
-                                    env
-                                ).1;
-                                // Require: if this method is chosen then nested must hold
-                                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                            }
-                        }
-                    }
-                }
-                (lhs, rhs) => {
-                    // Exclude mismatched concrete types
-                    // FIXME: Probably should use .compatible rather than != here?
-                    if lhs != rhs {
-                        // Exclude this method
-                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
-                    }
-                }
-            }
-        }
-
-        // Unify all pairs under m
-        println!("UNIFYING {unify_pairs:?}");
-        for (lhs_id, rhs_id) in &unify_pairs {
-            let mut lhs_map = type_variables.remove(lhs_id).unwrap_or(HashMap::new());
-            let mut rhs_map = type_variables.remove(rhs_id).unwrap_or(HashMap::new());
-
-            let mut all_tys: std::collections::HashSet<Type> = lhs_map.keys().cloned().collect();
-            all_tys.extend(rhs_map.keys().cloned());
-
-            for ty in all_tys {
-                println!(" - {ty}");
-                let var_lhs = lhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
-                let var_rhs = rhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
-                // Enforce equivalence under mvar: var_lhs <-> var_rhs
-                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_lhs, false), Lit::new(*var_rhs, true)]);
-                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_rhs, false), Lit::new(*var_lhs, true)]);
-            }
-
-            type_variables.insert(lhs_id.clone(), lhs_map);
-            type_variables.insert(rhs_id.clone(), rhs_map);
-        }
-    }
-
-    // SAT var for "some method holds"
-    let sat_var = solver.new_var_default();
-    // sat_var -> OR(method_vars)
-    let mut or_clause = method_vars.keys().copied()
-        .map(|v| Lit::new(v, true)).collect::<Vec<_>>();
-    or_clause.push(Lit::new(sat_var, false));
-    solver.add_clause_reuse(&mut or_clause);
-    // each method_var -> sat_var
-    for &v in method_vars.keys() {
-        solver.add_clause_reuse(&mut vec![Lit::new(v, false), Lit::new(sat_var, true)]);
-    }
-
-    (method_vars, sat_var)
+    }*/
 }
 
 pub fn typecheck_call(
     func_symbol: &SpanNode,
-    func: &str,
     args: impl Iterator<Item = Type>,
-    env: &Rc<RefCell<TypeEnvironment>>
+    env: &TypeEnvironment,
+    env_key: TypeEnvironmentKey
 ) -> Result<Type, EvalError> {
-    let call_tys: Vec<_> = args.collect();
-    let env_borrow = env.borrow();
-    let mut solver = BasicSolver::default();
-    let mut type_variables = HashMap::new();
-
-    // Build constraints for `func` just like an `imp` resolution
-    let (method_vars, sat) = add_match_constraints(
-        &mut solver,
-        &mut type_variables,
-        func,
-        &call_tys,
-        None,
-        None,
-        &*env_borrow
-    );
-
-    // XOR(type variable bindings)
-    for tv_vars in type_variables.values().map(|v| v.values()) {
-        solver.add_clause_reuse(
-            &mut tv_vars.clone().copied().map(|v| Lit::new(v, true)).collect()
-        );
-        let vars: Vec<Var> = tv_vars.copied().collect();
-        for i in 0..vars.len() {
-            for j in (i+1)..vars.len() {
-                solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
-            }
-        }
-    }
-
-    // Solve requiring that some method holds
-    solver.solve_limited(&[Lit::new(sat, true)]);
-
-    // Extract chosen method
-    let (chosen_method_var, chosen_method_ty) =
-        method_vars.into_iter().find(|(m, _)| solver.value_var(*m) == lbool::TRUE)
-        .ok_or(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })?;
-
-    // Extract type variable assignments
-    let mut concrete_type_variables = HashMap::new();
-    println!("{type_variables:?}");
-    for (tvname, tvmap) in type_variables {
-        for (ty, tyvar) in tvmap {
-            println!("{tyvar:?} = {:?}", solver.value_var(tyvar));
-            if solver.value_var(tyvar) == lbool::TRUE {
-                if let Some(existing_ty) = concrete_type_variables.get(&tvname) {
-                    assert_eq!(existing_ty, &ty);
-                } else {
-                    concrete_type_variables.insert(tvname.clone(), ty.clone());
-                }
-            }
-        }
-    }
-
-    println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
-
-    return Ok(chosen_method_ty);
-
-    Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
+    let get_methods_by_name = |name: &str| -> Option<&[Type]> {
+        env.get_function(env_key, &name.into())
+    };
+    resolve::resolve_method(func_symbol, args, get_methods_by_name)
 }
 
-fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type, EvalError> {
-    let get_methods = |func: &str| -> Option<Vec<Type>> {
-        Some(env.borrow().functions.get(&SmolStr::from(func))?.clone())
-    };
+fn typecheck(
+    node: &SpanNode,
+    env: &mut TypeEnvironment,
+    env_key: TypeEnvironmentKey
+) -> Result<Type, EvalError> {
     match &node.node {
         NodeValue::Bool(_) => Ok(Type::Bool),
         NodeValue::Number(_) => Ok(Type::Number),
         NodeValue::String(_) => Ok(Type::String),
         NodeValue::Symbol(name) => {
-            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag.clone() })?.clone())
+            Ok(env.get(env_key, &name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag.clone() })?.clone())
         },
         NodeValue::Typed(ty, _) => Ok(ty.clone()),
         NodeValue::Type(ty) => Ok(Type::Type(Some(Box::new(ty.clone())))),
@@ -427,7 +171,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                 Some("do") => {
                     let mut last = Type::UntypedList;
                     while let Some(elem) = list.next() {
-                        last = typecheck(elem, env)?;
+                        last = typecheck(elem, env, env_key)?;
                     }
                     Ok(last)
                 },
@@ -437,8 +181,8 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     let symbol = symbol_node.node.as_symbol()
                         .ok_or(EvalError::TypeMismatch { expected: "Symbol".into(), got: symbol_node.ty(), span: symbol_node.tag.clone() })?;
                     let val = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
-                    let val_ty = typecheck(val, env)?;
-                    env.borrow_mut().set(symbol.clone(), val_ty, true);
+                    let val_ty = typecheck(val, env, env_key)?;
+                    env.set(env_key, symbol.clone(), val_ty, true);
                     Ok(Type::UntypedList)
                 },
                 Some("set") => {
@@ -447,8 +191,9 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     let symbol = symbol_node.node.as_symbol()
                         .ok_or(EvalError::TypeMismatch { expected: "Symbol".into(), got: symbol_node.ty(), span: symbol_node.tag.clone() })?;
                     let val = list.next().ok_or(EvalError::ExpectedAdditionalField { span: node.tag.clone() })?;
-                    if let Some(to_ty) = env.borrow().get(symbol) {
-                        let from_ty = typecheck(val, env)?;
+                    // FIXME: Probably don't need the clone here
+                    if let Some(to_ty) = env.get(env_key, symbol).cloned() {
+                        let from_ty = typecheck(val, env, env_key)?;
                         if from_ty != to_ty {
                             Err(EvalError::TypeMismatch { expected: format!("{}", to_ty), got: from_ty, span: val.tag.clone() })
                         } else {
@@ -477,16 +222,15 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     let ret_ty = ret.into_type().map_err(|e| EvalError::TypeMismatch { expected: "Type".into(), got: e.ty(), span: e.tag })?;
 
                     // Recurse typecheck function body
-                    let mut new_env = TypeEnvironment::new_child(Rc::clone(env));
+                    let mut new_env_key = env.new_child(env_key);
                     for (param_name, param_ty) in param_names.iter().zip(param_tys.iter()) {
                         //println!("Setting function env {param} = {arg}");
-                        new_env.set(param_name.clone(), param_ty.clone(), true);
+                        env.set(new_env_key, param_name.clone(), param_ty.clone(), true);
                     }
-                    let new_env_rc = Rc::new(RefCell::new(new_env));
 
                     let body = list.next().unwrap();
-                    let body_ty = typecheck(body, &new_env_rc)?;
-                    if !ret_ty.compatible(&body_ty, &get_methods, &mut Default::default()) {
+                    let body_ty = typecheck(body, env, new_env_key)?;
+                    if !ret_ty.compatible(&body_ty, &mut Default::default()) {
                         return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
                     }
 
@@ -498,37 +242,38 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                     let func = list.next().unwrap();
                     let method = list.next().unwrap();
 
-                    let method_ty = typecheck(method, env)?;
+                    let method_ty = typecheck(method, env, env_key)?;
                     let func_name = func.as_symbol().unwrap();
 
-                    if env.borrow().functions.contains_key(func_name) {
-                        env.borrow_mut().functions.get_mut(func_name).unwrap().push(method_ty);
-                    } else {
-                        env.borrow_mut().functions.insert(func_name.clone(),vec![method_ty]);
-                    }
+                    env.def(env_key, func_name.clone(), method_ty);
 
                     Ok(Type::UntypedList)
                 },
                 Some("print") => {
                     let val = list.next().unwrap();
-                    typecheck(val, env)
+                    typecheck(val, env, env_key)
                 },
                 Some("call") => {
                     unimplemented!()
                 },
                 Some(func) => {
-                    typecheck_call(first, func, list.map(|e| typecheck(e, env)).collect::<Result<Vec<_>,_>>()?.into_iter(), env)
+                    typecheck_call(
+                        first,
+                        list.map(|e| typecheck(e, env, env_key)).collect::<Result<Vec<_>,_>>()?.into_iter(),
+                        env,
+                        env_key
+                    )
                 },
                 _ => {
                     let first_tag = first.tag.clone();
-                    let first = typecheck(first, env)?;
+                    let first = typecheck(first, env, env_key)?;
                     if let Type::Type(Some(ty)) = first {
                         match &*ty {
                             Type::Struct(fields) => {
                                 let fields = fields.as_table().unwrap().borrow();
                                 let table = list.next().unwrap().as_table().unwrap();
                                 for (k, v) in table.borrow().iter() {
-                                    let v_ty = typecheck(v, env)?;
+                                    let v_ty = typecheck(v, env, env_key)?;
 
                                     if let Some(expected_ty) = fields.get(k) {
                                         let expected_ty = expected_ty.as_type().unwrap();
@@ -553,7 +298,7 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
                                 let create_variant_list = SpanNode::new_list(Default::default(), Reference::new(
                                     vec![Node::new_type(Default::default(), variant.clone()), value.clone()]
                                 ));
-                                let got_ty = typecheck(&create_variant_list, env)?;
+                                let got_ty = typecheck(&create_variant_list, env, env_key)?;
                                 let expected_ty = variant;
                                 if got_ty != *expected_ty {
                                     return Err(EvalError::TypeMismatch { expected: format!("{expected_ty}"), got: got_ty, span: first_tag })
@@ -574,7 +319,11 @@ fn typecheck(node: &SpanNode, env: &Rc<RefCell<TypeEnvironment>>) -> Result<Type
     }
 }
 
-pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
+pub fn eval_static(
+    node: SpanNode,
+    env: &mut Environment,
+    env_key: EnvironmentKey
+) -> Result<SpanNode, EvalError> {
     match node.node {
         NodeValue::Bool(_)
             | NodeValue::Number(_)
@@ -591,21 +340,18 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
                 let func_symbol = list.first().cloned().unwrap();
                 let mut list_iter = list.iter_mut();
                 if let Some(func_symbol) = func_symbol.as_symbol() {
-                    let env_ref = env.borrow();
                     if func_symbol.as_str() == "static" {
                         let val = list_iter.nth(1).unwrap();
-                        drop(env_ref);
-                        return eval(val.clone(), env);
-                    } else if let Some(ref node) = env_ref.get(func_symbol) {
+                        return eval(val.clone(), env, env_key);
+                    } else if let Some(node) = env.get(env_key, func_symbol).cloned() {
                         if node.ty() == Type::Function {
                             let methods = node.as_typed().unwrap().1.as_list().unwrap().borrow();
-                            drop(env_ref);
                             for method in methods.iter().map(|m| m.as_method().unwrap().borrow()) {
                                 match &*method {
                                     Method::Rust { ty: Type::Macro, callback } => {
                                         //let args = list_iter.skip(1).map(|n| eval_static(n.clone(), env)).collect::<Result<Vec<_>, _>>()?.into_iter();
                                         let args = list_iter.skip(1).map(|n| n.clone()).collect::<Vec<_>>().into_iter();
-                                        return eval_static(callback(args, env)?, env);
+                                        return eval_static(callback(args, env, env_key)?, env, env_key);
                                     }
                                     _ => continue
                                 }
@@ -614,7 +360,7 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
                     }
                 }
                 for elem in list_iter {
-                    let _ = mem::replace(elem, eval_static(elem.clone(), env)?);
+                    let _ = mem::replace(elem, eval_static(elem.clone(), env, env_key)?);
                 }
                 drop(list);
                 Ok(node)
@@ -625,8 +371,8 @@ pub fn eval_static(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<Spa
                 let mut t = mem::take(&mut *table.borrow_mut());
                 t = t.into_iter().map(|(key, val)| {
                     Ok::<_, EvalError>((
-                        eval_static(key, env)?,
-                        eval_static(val, env)?
+                        eval_static(key, env, env_key)?,
+                        eval_static(val, env, env_key)?
                     ))
                 }).collect::<Result<IndexMap<_, _>, _>>()?;
                 let _ = mem::replace(&mut *table.borrow_mut(), t);
@@ -664,57 +410,57 @@ fn main() {
     println!("Tree: {tree}");
 
     // Eval
-    let mut global_env = Environment::new();
-    global_env.global_set("Unit".into(), Node::new_type(Default::default(), Type::Unit));
-    global_env.global_set("Any".into(), Node::new_type(Default::default(), Type::Any));
-    global_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type(None)));
-    global_env.global_set("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
-    global_env.global_set("Number".into(), Node::new_type(Default::default(), Type::Number));
-    global_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
-    global_env.global_set("String".into(), Node::new_type(Default::default(), Type::String));
-    global_env.global_set("Function".into(), Node::new_type(Default::default(), Type::Number));
+    let mut runtime_env = Environment::new();
+    let global_key = runtime_env.global;
+    runtime_env.global_set("Unit".into(), Node::new_type(Default::default(), Type::Unit));
+    runtime_env.global_set("Any".into(), Node::new_type(Default::default(), Type::Any));
+    runtime_env.global_set("Type".into(), Node::new_type(Default::default(), Type::Type(None)));
+    runtime_env.global_set("Unknown".into(), Node::new_type(Default::default(), Type::Unknown));
+    runtime_env.global_set("Number".into(), Node::new_type(Default::default(), Type::Number));
+    runtime_env.global_set("Bool".into(), Node::new_type(Default::default(), Type::Bool));
+    runtime_env.global_set("String".into(), Node::new_type(Default::default(), Type::String));
+    runtime_env.global_set("Function".into(), Node::new_type(Default::default(), Type::Number));
 
     // Special forms
-    global_env.def_special_form("list".into(), Box::new(|args, env| {
+    runtime_env.global_def_special_form("list".into(), Box::new(|args, env, env_key| {
         let span = args.clone().next().unwrap().tag.clone();
         Ok(Node::new_list(
             span,
-            Reference::new(args.map(|arg| eval(arg, env)).collect::<Result<Vec<_>, _>>()?)
+            Reference::new(args.map(|arg| eval(arg, env, env_key)).collect::<Result<Vec<_>, _>>()?)
         ))
     }));
-    global_env.def_special_form("loop".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("loop".into(), Box::new(|mut args, env, env_key| {
         let body = args.next().unwrap();
         loop {
-            if let NodeValue::Bool(b) = eval(body.clone(), env)?.node {
+            if let NodeValue::Bool(b) = eval(body.clone(), env, env_key)?.node {
                 if b { break; }
             }
         }
         Ok(Node::new_list(Default::default(), Reference::new(vec![])))
     }));
-    global_env.def_special_form("do".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("do".into(), Box::new(|mut args, env, env_key| {
         // Create a new scope
-        let new_env = Environment::new_child(Rc::clone(env));
-        let new_env_rc = Rc::new(RefCell::new(new_env));
+        let new_env_key = env.new_child(env_key);
         let mut res = Node::new_list(Default::default(), Reference::new(Vec::new()));
 
         while let Some(arg) = args.next() {
-            res = eval(arg, &new_env_rc)?;
+            res = eval(arg, env, new_env_key)?;
         }
         Ok(res)
     }));
-    global_env.def_special_form("quote".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("quote".into(), Box::new(|mut args, env, env_key| {
         Ok(args.next().unwrap())
     }));
-    global_env.def_special_form("static".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("static".into(), Box::new(|mut args, env, env_key| {
         let mut res = Node::new_list(Default::default(), Reference::new(Vec::new()));
 
         if let Some(arg) = args.next() {
-            res = eval(arg, &env)?;
+            res = eval(arg, env, env_key)?;
         }
         Ok(res)
     }));
-    global_env.def_special_form("get".into(), Box::new(|mut args, env| {
-        let (ty, var) = eval(args.next().unwrap(), env)?.with_type();
+    runtime_env.global_def_special_form("get".into(), Box::new(|mut args, env, env_key| {
+        let (ty, var) = eval(args.next().unwrap(), env, env_key)?.with_type();
         let key = args.next().unwrap();
 
         if let NodeValue::Table(map) = var.node {
@@ -725,62 +471,62 @@ fn main() {
             panic!("Can only get from table/list objects, got: {var}")
         }
     }));
-    global_env.def_special_form("let".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("let".into(), Box::new(|mut args, env, env_key| {
         let name = args.next().unwrap();
-        let value = eval(args.next().unwrap(), env)?;
+        let value = eval(args.next().unwrap(), env, env_key)?;
         if let NodeValue::Symbol(ref name) = name.node {
-            env.borrow_mut().set(name.clone(), value, true);
+            env.set(env_key, name.clone(), value, true);
         }
         Ok(name)
     }));
-    global_env.def_special_form("set".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("set".into(), Box::new(|mut args, env, env_key| {
         let name = args.next().unwrap();
-        let value = eval(args.next().unwrap(), env)?;
+        let value = eval(args.next().unwrap(), env, env_key)?;
         if let NodeValue::Symbol(ref name) = name.node {
-            env.borrow_mut().set(name.clone(), value, false);
+            env.set(env_key, name.clone(), value, false);
         }
         Ok(name)
     }));
-    global_env.def_special_form("global-set".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("global-set".into(), Box::new(|mut args, env, env_key| {
         let name = args.next().unwrap();
-        let value = eval(args.next().unwrap(), env)?;
+        let value = eval(args.next().unwrap(), env, env_key)?;
         if let NodeValue::Symbol(ref name) = name.node {
-            env.borrow_mut().global_set(name.clone(), value);
+            env.global_set(name.clone(), value);
         }
         Ok(name)
     }));
-    global_env.def_special_form("def".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("def".into(), Box::new(|mut args, env, env_key| {
         let name_symbol = args.next().unwrap();
-        let method = eval(args.next().unwrap(), env)?;
+        let method = eval(args.next().unwrap(), env, env_key)?;
         assert!(method.is_method());
 
         if let NodeValue::Symbol(ref name) = name_symbol.node {
-            env.borrow_mut().global_def(name.clone(), method);
+            env.global_def(name.clone(), method);
         }
         Ok(name_symbol)
     }));
-    global_env.def_special_form("local-def".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("local-def".into(), Box::new(|mut args, env, env_key| {
         let name_symbol = args.next().unwrap();
 
         let mut list = vec![Node::new_symbol(Default::default(), "fn".into())];
         list.extend(args);
 
-        let value = eval(Node::new_list(name_symbol.tag.clone(), Reference::new(list)), env)?;
+        let value = eval(Node::new_list(name_symbol.tag.clone(), Reference::new(list)), env, env_key)?;
         assert!(value.is_method());
         if let NodeValue::Symbol(ref name) = name_symbol.node {
-            env.borrow_mut().def(name.clone(), value);
+            env.def(env_key, name.clone(), value);
         }
         Ok(name_symbol)
     }));
-    global_env.def_special_form("call".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("call".into(), Box::new(|mut args, env, env_key| {
         let func_symbol = args.next().unwrap();
-        Ok(eval_call(func_symbol.clone(), eval(func_symbol, env)?, args, env)?)
+        Ok(eval_call(func_symbol.clone(), eval(func_symbol, env, env_key)?, args, env, env_key)?)
     }));
-    global_env.def_special_form("fn".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("fn".into(), Box::new(|mut args, env, env_key| {
         let params = args.next().unwrap(); // let params = eval(args.next().unwrap(), env)?;
         let arrow = args.next().unwrap();
         arrow.node.as_symbol().filter(|s| **s == "->").ok_or(EvalError::Generic(arrow.tag))?;
-        let ret_ty = eval(args.next().unwrap(), env)?;
+        let ret_ty = eval(args.next().unwrap(), env, env_key)?;
         let block = args.next().unwrap();
 
         if !params.is_table() {
@@ -791,8 +537,8 @@ fn main() {
             .map_err(|n| EvalError::TypeMismatch { expected: "Table".to_string(), got: n.ty(), span: n.tag })?;
         let params = params.borrow();
 
-        let parse_param_type = |node: &SpanNode| -> Result<Type, EvalError> {
-            Ok(eval(node.clone(), env)?.into_type().unwrap())
+        let mut parse_param_type = |node: &SpanNode| -> Result<Type, EvalError> {
+            Ok(eval(node.clone(), env, env_key)?.into_type().unwrap())
         };
 
         let func_ty = Type::Method {
@@ -803,11 +549,11 @@ fn main() {
         };
         Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
             param_names: params.keys().cloned().map(|n| n.into_keyword().unwrap()).collect(),
-            env: Rc::clone(env), body: Box::new(block), ty: func_ty
+            env: env_key, body: Box::new(block), ty: func_ty
         })))
     }));
-    global_env.def_special_form("if".into(), Box::new(|mut args, env| {
-        let cond = eval(args.next().unwrap(), env)?;
+    runtime_env.global_def_special_form("if".into(), Box::new(|mut args, env, env_key| {
+        let cond = eval(args.next().unwrap(), env, env_key)?;
         let yes = args.next().unwrap();
         let mut no = None;
         if let Some(else_symbol) = args.next() {
@@ -815,21 +561,21 @@ fn main() {
         }
 
         if cond.into_bool().unwrap() {
-            Ok(eval(yes, env)?)
+            Ok(eval(yes, env, env_key)?)
         } else if let Some(no) = no {
-            Ok(eval(no, env)?)
+            Ok(eval(no, env, env_key)?)
         } else {
             Ok(Node::new_list(Default::default(), Reference::new(vec![])))
         }
     }));
-    global_env.def_special_form("imp".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_special_form("imp".into(), Box::new(|mut args, env, env_key| {
         let elem: Vec<SpanNode> = args.collect();
 
         let func_name = elem[0].node.as_symbol().unwrap().clone();
         let param_types: Vec<Type> = elem[1..elem.len()-2].iter().map(|e| {
-            Ok::<_, EvalError>(eval(e.clone(), env)?.into_type().unwrap())
+            Ok::<_, EvalError>(eval(e.clone(), env, env_key)?.into_type().unwrap())
         }).collect::<Result<_, _>>()?;
-        let ret_type = eval(elem.last().unwrap().clone(), env)?.into_type().unwrap();
+        let ret_type = eval(elem.last().unwrap().clone(), env, env_key)?.into_type().unwrap();
 
         let imp = Implementation {
             func: func_name,
@@ -842,54 +588,54 @@ fn main() {
     }));
 
     // Methods
-    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("+".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_string()
             .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_string()
             .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_string(Default::default(), (a.to_string() + b.as_str()).into()))
     }), Type::Method { params: vec![Type::String, Type::String], ret: Box::new(Type::String) });
-    global_env.def_rust_method("+".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("+".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a + b))
     }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("-".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("-".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a - b))
     }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("lt".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("lt".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a < b))
     }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
-    global_env.def_rust_method("=".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("=".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a == b))
     }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
-    global_env.def_rust_method("refeq".into(), Box::new(|mut args, env| {
-        let a = eval(args.next().unwrap(), env)?;
-        let b = eval(args.next().unwrap(), env)?;
+    runtime_env.global_def_rust_method("refeq".into(), Box::new(|mut args, env, env_key| {
+        let a = eval(args.next().unwrap(), env, env_key)?;
+        let b = eval(args.next().unwrap(), env, env_key)?;
         Ok(Node::new_bool(Default::default(), a == b))
     }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
     let out = Rc::new(RefCell::new(BufWriter::new(std::io::stdout())));
-    global_env.def_rust_method("print".into(), Box::new(move |mut args, env| {
+    runtime_env.global_def_rust_method("print".into(), Box::new(move |mut args, env, env_key| {
         let value = args.next().unwrap();
         //writeln!(out.borrow_mut(), "{value}");
         println!("{value}");
         Ok(value)
     }), Type::Method { params: vec![Type::Any], ret: Box::new(Type::Any) });
-    global_env.def_rust_method("struct".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("struct".into(), Box::new(|mut args, env, env_key| {
         let structure = args.next().unwrap();
         assert!(structure.is_table());
 
@@ -897,7 +643,7 @@ fn main() {
             Box::new(structure)
         )))
     }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
-    global_env.def_rust_method("enum".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_method("enum".into(), Box::new(|mut args, env, env_key| {
         let enumeration = args.next().unwrap();
 
         Ok(Node::new_type(Default::default(), Type::Enum(
@@ -913,11 +659,11 @@ fn main() {
     }), Type::Method { params: vec![Type::Type], ret: Box::new(Type::Type) });*/
 
     // Macros
-    global_env.def_rust_macro("def!".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_macro("def!".into(), Box::new(|mut args, env, env_key| {
         let name_symbol = args.next().unwrap();
         let params = args.next().unwrap();
         let arrow = args.next().unwrap();
-        let ret_ty = eval(args.next().unwrap(), env)?;
+        let ret_ty = eval(args.next().unwrap(), env, env_key)?;
         let block = args.next().unwrap();
 
         if let NodeValue::Table(ref table) = params.node {
@@ -940,7 +686,7 @@ fn main() {
             ]))
         ])))
     }));
-    global_env.def_rust_macro("new!".into(), Box::new(|mut args, env| {
+    runtime_env.global_def_rust_macro("new!".into(), Box::new(|mut args, env, env_key| {
         let ty = args.next().unwrap();
         let val = args.next().unwrap();
 
@@ -953,9 +699,9 @@ fn main() {
         ])))
     }));
 
-    let global_env_rc = Rc::new(RefCell::new(global_env));
     // Static pass
-    let tree = match eval_static(tree, &global_env_rc) {
+    println!("Running static pass...");
+    let tree = match eval_static(tree, &mut runtime_env, global_key) {
         Ok(t) => t,
         Err(e) => {
             let diagnostic = Diagnostic::error()
@@ -972,18 +718,18 @@ fn main() {
 
     // Typecheck pass
     let mut type_env = TypeEnvironment::new();
-    for (k, v) in global_env_rc.borrow().bindings.iter() {
+    let env_key = type_env.global;
+    for (k, v) in runtime_env.get_scope(runtime_env.global).unwrap().bindings.iter() {
         //println!("SETTING TE {k} = {v} i.e. {}", v.ty());
-        type_env.set(k.clone(), v.ty(), false);
+        type_env.set(env_key, k.clone(), v.ty(), false);
         if v.ty().is_function() {
             for method in v.as_typed().unwrap().1.as_list().unwrap().borrow().iter() {
                 //println!(" - {method}");
-                type_env.def(k.clone(), method.ty());
+                type_env.def(env_key, k.clone(), method.ty());
             }
         }
     }
-    let type_env_rc = Rc::new(RefCell::new(type_env));
-    if let Err(e) = typecheck(&tree, &type_env_rc) {
+    if let Err(e) = typecheck(&tree, &mut type_env, env_key) {
         let diagnostic = Diagnostic::error()
             .with_labels(vec![
                 Label::primary(file, e.span())
@@ -995,7 +741,8 @@ fn main() {
     }
 
     // Main pass
-    let result = eval(tree, &global_env_rc);
+    println!("Running main pass...");
+    let result = eval(tree, &mut runtime_env, global_key);
 
     match result {
         Ok(r) => println!("Result: {r}"),

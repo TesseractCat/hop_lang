@@ -2,6 +2,7 @@ use std::{cell::RefCell, collections::HashMap, mem, rc::Rc};
 
 use indexmap::IndexMap;
 use logos::Span;
+use slotmap::{new_key_type, SlotMap};
 use smol_str::SmolStr;
 use thiserror::Error;
 
@@ -38,87 +39,85 @@ impl EvalError {
     }
 }
 
+new_key_type! { pub struct EnvironmentKey; }
 #[derive(Default, Debug, PartialEq)]
-pub struct Environment {
+pub struct EnvironmentScope {
     pub bindings: HashMap<SmolStr, SpanNode>,
-    up: Option<Rc<RefCell<Self>>>,
-    global: Option<Rc<RefCell<Self>>>
+    up: Option<EnvironmentKey>,
+}
+#[derive(Default, Debug)]
+pub struct Environment {
+    pub global: EnvironmentKey,
+    scopes: SlotMap<EnvironmentKey, EnvironmentScope>
 }
 impl Environment {
     pub fn new() -> Self {
-        Self {
+        let global_scope = EnvironmentScope {
             ..Default::default()
-        }
+        };
+        let mut scopes = SlotMap::<EnvironmentKey, EnvironmentScope>::with_key();
+        let global_scope_key = scopes.insert(global_scope);
+        Self { global: global_scope_key, scopes, ..Default::default() }
     }
 
-    pub fn new_child(this: Rc<RefCell<Self>>) -> Self {
-        Self {
-            up: Some(Rc::clone(&this)),
-            global: Some(
-                if this.borrow().global.is_some() {
-                    this.borrow().global.clone().unwrap()
-                } else {
-                    this
-                }
-            ),
+    pub fn new_child(&mut self, current: EnvironmentKey) -> EnvironmentKey {
+        let child_scope = EnvironmentScope {
+            up: Some(current),
             ..Default::default()
-        }
+        };
+        self.scopes.insert(child_scope)
     }
 
-    pub fn get(&self, name: &SmolStr) -> Option<SpanNode> {
-        if let Some(binding) = self.bindings.get(name) {
-            Some(binding.clone())
-        } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
-            let mut env = up;
-            while env.borrow().bindings.get(name).is_none() {
-                let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
-                if let Some(up) = up {
-                    env = up;
-                } else {
-                    break;
-                }
+    pub fn get_scope(&self, current: EnvironmentKey) -> Option<&EnvironmentScope> {
+        self.scopes.get(current)
+    }
+
+    pub fn get(&self, current: EnvironmentKey, name: &SmolStr) -> Option<&SpanNode> {
+        if let Some(binding) = self.scopes.get(current).unwrap().bindings.get(name) {
+            return Some(binding);
+        }
+
+        let mut current = current;
+        while let Some(parent) = self.scopes.get(current).unwrap().up {
+            current = parent;
+            if let Some(binding) = self.scopes.get(current).unwrap().bindings.get(name) {
+                return Some(binding);
             }
-            let r = env.borrow().bindings.get(name).cloned();
-            r
-        } else {
-            None
         }
+
+        None
     }
-    pub fn has(&self, name: &SmolStr) -> bool {
-        self.get(name).is_some()
+    pub fn has(&self, current: EnvironmentKey, name: &SmolStr) -> bool {
+        self.get(current, name).is_some()
     }
-    pub fn set(&mut self, name: SmolStr, value: SpanNode, shadow: bool) {
-        if self.has(&name) && !shadow {
-            if let Some(binding) = self.bindings.get_mut(&name) {
+    pub fn set(&mut self, current: EnvironmentKey, name: SmolStr, value: SpanNode, shadow: bool) {
+        if self.has(current, &name) && !shadow {
+            if let Some(binding) = self.scopes.get_mut(current).unwrap().bindings.get_mut(&name) {
                 let _ = mem::replace(binding, value);
-            } else if let Some(up) = self.up.as_ref().map(|r| Rc::clone(&r)) {
-                let mut env = up;
-                while env.borrow().bindings.get(&name).is_none() {
-                    let up = env.borrow().up.as_ref().map(|r| Rc::clone(&r));
-                    if let Some(up) = up {
-                        env = up;
-                    } else {
-                        break;
-                    }
-                }
-                let mut borrow = env.borrow_mut();
-                let binding = borrow.bindings.get_mut(&name);
-                if let Some(binding) = binding {
+                return;
+            }
+
+            let mut current = current;
+            while let Some(parent) = self.scopes.get(current).unwrap().up {
+                current = parent;
+                if let Some(binding) = self.scopes.get_mut(current).unwrap().bindings.get_mut(&name) {
                     let _ = mem::replace(binding, value);
+                    return;
                 }
             }
         } else {
-            self.bindings.insert(name, value.clone());
+            self.scopes.get_mut(current).unwrap().bindings.insert(name, value);
         }
     }
-    pub fn def(&mut self, name: SmolStr, value: SpanNode) {
-        if self.has(&name) {
-            let (ty, list) = self.get(&name).unwrap().with_type();
+    pub fn def(&mut self, current: EnvironmentKey, name: SmolStr, value: SpanNode) {
+        if self.has(current, &name) {
+            let (ty, list) = self.get(current, &name).unwrap().clone().with_type();
             assert!(ty.is_function());
             list.into_list().unwrap().borrow_mut().push(value);
         } else {
             self.set(
-                name.clone(), 
+                current,
+                name, 
                 Node::new_typed(Default::default(), Type::Function,
                     Node::new_list(Default::default(), Reference::new(vec![value]))
                 ), false
@@ -126,44 +125,48 @@ impl Environment {
         }
     }
 
-    pub fn global_get(&mut self, name: &SmolStr) -> Option<SpanNode> {
-        if let Some(ref mut global) = self.global {
-            global.borrow_mut().get(name)
-        } else {
-            self.get(name)
-        }
+    pub fn global_get(&mut self, name: &SmolStr) -> Option<&SpanNode> {
+        self.get(self.global, name)
     }
     pub fn global_set(&mut self, name: SmolStr, value: SpanNode) {
-        if let Some(ref mut global) = self.global {
-            global.borrow_mut().set(name, value, false);
-        } else {
-            self.set(name, value, false);
-        }
+        self.set(self.global, name, value, false)
     }
     pub fn global_def(&mut self, name: SmolStr, value: SpanNode) {
-        if let Some(ref mut global) = self.global {
-            global.borrow_mut().def(name, value);
-        } else {
-            self.def(name, value);
-        }
+        self.def(self.global, name, value)
     }
 
-    pub fn def_rust_method(&mut self, name: SmolStr, value: Box<Callback>, ty: Type) {
-        self.def(name, Node::new_method(Default::default(), Reference::new(
+    pub fn def_rust_method(&mut self, current: EnvironmentKey, name: SmolStr, value: Box<Callback>, ty: Type) {
+        self.def(current, name, Node::new_method(Default::default(), Reference::new(
             Method::Rust { callback: value, ty }
         )))
     }
-    pub fn def_rust_macro(&mut self, name: SmolStr, value: Box<Callback>) {
-        self.def_rust_method(name, value, Type::Macro);
+    pub fn def_rust_macro(&mut self, current: EnvironmentKey, name: SmolStr, value: Box<Callback>) {
+        self.def_rust_method(current, name, value, Type::Macro);
     }
-    pub fn def_special_form(&mut self, name: SmolStr, value: Box<Callback>) {
-        self.def_rust_method(name, value, Type::SpecialForm);
+    pub fn def_special_form(&mut self, current: EnvironmentKey, name: SmolStr, value: Box<Callback>) {
+        self.def_rust_method(current, name, value, Type::SpecialForm);
+    }
+
+    pub fn global_def_rust_method(&mut self, name: SmolStr, value: Box<Callback>, ty: Type) {
+        self.def_rust_method(self.global, name, value, ty);
+    }
+    pub fn global_def_rust_macro(&mut self, name: SmolStr, value: Box<Callback>) {
+        self.def_rust_macro(self.global, name, value);
+    }
+    pub fn global_def_special_form(&mut self, name: SmolStr, value: Box<Callback>) {
+        self.def_special_form(self.global, name, value);
     }
 }
 
-pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<Item = SpanNode>, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
+pub fn eval_call(
+    func_symbol: SpanNode,
+    func: SpanNode,
+    mut args: impl Iterator<Item = SpanNode>,
+    env: &mut Environment,
+    env_key: EnvironmentKey
+) -> Result<SpanNode, EvalError> {
     let get_methods = |func: &str| -> Option<Vec<Type>> {
-        let (ty, methods) = env.borrow().get(&func.into())?.with_type();
+        let (ty, methods) = env.get(env_key, &func.into())?.clone().with_type();
         if ty.is_function() {
             Some(methods.as_list().unwrap().borrow().iter().map(|n| n.ty()).collect())
         } else {
@@ -182,7 +185,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                 if is_special_form || is_macro {
                     Ok((arg.ty(), arg))
                 } else {
-                    let evaled = eval(arg, env)?;
+                    let evaled = eval(arg, env, env_key)?;
                     Ok::<_, EvalError>((evaled.ty(), evaled))
                 }
             })
@@ -193,7 +196,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         for method in methods {
             let borrowed = method.borrow();
             match &*borrowed {
-                Method::Hop { param_names, env, body, ty } => {
+                Method::Hop { param_names, env: env_key, body, ty } => {
                     let method_ty = ty.clone().into_method().unwrap();
                     let method_param_names = param_names;
                     let method_param_tys = method_ty.0;
@@ -209,7 +212,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
                     if method_param_tys.iter().zip(&call_tys)
                         .filter(|&(a, b)| {
-                            if a.compatible(b, &get_methods, &mut placeholder_matches) {
+                            if a.compatible(b, &mut placeholder_matches) {
                                 true
                             } else {
                                 //println!("    - {a} not compatible with {b}");
@@ -219,17 +222,16 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     {
                         // Call method
                         // Create a new scope
-                        let mut new_env = Environment::new_child(Rc::clone(env));
+                        let mut new_env_key = env.new_child(*env_key);
 
                         for (param, arg) in method_param_names.into_iter().zip(call_args.into_iter()) {
                             //println!("Setting function env {param} = {arg}");
-                            new_env.set(param.clone(), arg, true);
+                            env.set(new_env_key, param.clone(), arg, true);
                         }
 
-                        let new_env_rc = Rc::new(RefCell::new(new_env));
-                        let res = eval(*body.clone(), &new_env_rc)?;
+                        let res = eval(*body.clone(), env, new_env_key)?;
                         let res_ty = res.ty();
-                        return if method_ret_ty.compatible(&res_ty, &get_methods, &mut placeholder_matches) {
+                        return if method_ret_ty.compatible(&res_ty, &mut placeholder_matches) {
                             Ok(res)
                         } else {
                             Err(EvalError::TypeMismatch { expected: format!("{}", method_ret_ty), got: res_ty, span: body_tag })
@@ -237,8 +239,8 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     }
                 },
                 Method::Rust { callback, ty } => {
-                    if *ty == Type::SpecialForm { return callback(call_args.into_iter(), env) } // Macro
-                    if *ty == Type::Macro { return eval(callback(call_args.into_iter(), env)?, env) } // Macro
+                    if *ty == Type::SpecialForm { return callback(call_args.into_iter(), env, env_key) } // Macro
+                    if *ty == Type::Macro { return eval(callback(call_args.into_iter(), env, env_key)?, env, env_key) } // Macro
                     let method_ty = ty.clone().into_method().unwrap();
                     let method_param_tys = method_ty.0;
                     let method_ret_ty = method_ty.1;
@@ -250,7 +252,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     let mut placeholder_matches: HashMap<SmolStr, Type> = HashMap::new();
                     if method_param_tys.iter().zip(&call_tys)
                         .filter(|&(a, b)| {
-                            if a.compatible(b, &get_methods, &mut placeholder_matches) {
+                            if a.compatible(b,  &mut placeholder_matches) {
                                 true
                             } else {
                                 //println!("    - {a} not compatible with {b}");
@@ -260,7 +262,8 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                     {
                         return callback(
                             call_args.into_iter(),
-                            env
+                            env,
+                            env_key
                         );
                     }
                 }
@@ -271,7 +274,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         // Create type instance
         match ty {
             Type::Struct(_) => {
-                let val = eval(args.next().unwrap(), env)?;
+                let val = eval(args.next().unwrap(), env, env_key)?;
                 // FIXME: Check that fields are correct
                 Ok(Node::new_typed(func.tag, ty, val))
             },
@@ -285,7 +288,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
                 let create_variant_list = SpanNode::new_list(Default::default(), Reference::new(
                     vec![Node::new_type(Default::default(), variant.clone()), value.clone()]
                 ));
-                let got = eval(create_variant_list, env)?;
+                let got = eval(create_variant_list, env, env_key)?;
                 let got_ty = got.ty();
                 let expected_ty = variant;
                 if got_ty != *expected_ty {
@@ -303,7 +306,7 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
             },
             Type::TypeVariable { id, implements } => {
                 assert!(implements.is_none());
-                let imp_list: Vec<SpanNode> = args.map(|arg| eval(arg, env)).collect::<Result<_, _>>()?;
+                let imp_list: Vec<SpanNode> = args.map(|arg| eval(arg, env, env_key)).collect::<Result<_, _>>()?;
                 for imp in &imp_list {
                     assert!(imp.is_implementation());
                 }
@@ -322,11 +325,15 @@ pub fn eval_call(func_symbol: SpanNode, func: SpanNode, mut args: impl Iterator<
         return Err(EvalError::CalledNonFunc { span: func_symbol.tag });
     }
 }
-pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, EvalError> {
+pub fn eval(
+    node: SpanNode,
+    env: &mut Environment,
+    env_key: EnvironmentKey
+) -> Result<SpanNode, EvalError> {
     match node.node {
         NodeValue::Bool(_) | NodeValue::Number(_) | NodeValue::String(_) | NodeValue::Keyword(_) | NodeValue::Type(_) | NodeValue::Typed(_, _) => Ok(node),
         NodeValue::Symbol(name) => {
-            Ok(env.borrow_mut().get(&name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag })?.clone())
+            Ok(env.get(env_key, &name).ok_or(EvalError::UndefinedVar { name: name.to_string(), span: node.tag })?.clone())
         },
         NodeValue::List(ref list) => {
             if list.borrow().len() == 0 {
@@ -334,9 +341,9 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
             } else {
                 let list = list.borrow();
                 let func_symbol = list.first().cloned().unwrap();
-                let func = eval(func_symbol.clone(), env)?;
+                let func = eval(func_symbol.clone(), env, env_key)?;
                 let args = list.iter().cloned().skip(1);
-                eval_call(func_symbol, func, args, env)
+                eval_call(func_symbol, func, args, env, env_key)
             }
         },
         NodeValue::Table(ref table) => {
@@ -344,7 +351,7 @@ pub fn eval(node: SpanNode, env: &Rc<RefCell<Environment>>) -> Result<SpanNode, 
             {
                 let table = table.borrow();
                 for (k, v) in table.iter() {
-                    new_table.insert(eval(k.clone(), env)?, eval(v.clone(), env)?);
+                    new_table.insert(eval(k.clone(), env, env_key)?, eval(v.clone(), env, env_key)?);
                 }
             }
             Ok(Node::new_table(node.tag, Reference::new(new_table)))

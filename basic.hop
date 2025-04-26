@@ -4,9 +4,12 @@ static {
     //def! identity [x: 'a] -> 'a { x };
     //def identitytwo (fn [x: 'a] -> 'a { x });
     //print (imp + Number Number -> Number);
-    def addone (fn [w: 'x, x: '_ (imp identity ('_ (imp + Number Number -> '_)) -> '_)] -> 'x { + x 1 });
+    //def addone (fn [w: 'x, x: '_ (imp identity ('_ (imp + Number Number -> '_)) -> '_)] -> 'x { + x 1 });
+    //def addone (fn [x: Number] -> Number { + x 1 });
 };
-def! identity [x: 'a] -> 'a { x };
-def! test [x: 'a] -> String { + x "meow" };
-test 1;
-print (identity (addone 1 2));
+//def! identity [x: 'a] -> 'a { x };
+//def! test [x: 'a] -> String { + x "meow" };
+//test 1;
+def! testtwo [x: 'a (imp + 'a String -> String)] -> String { + x "meow" };
+testtwo "ba";
+//print (identity (addone 1 2));

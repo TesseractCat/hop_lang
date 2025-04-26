@@ -220,7 +220,7 @@ pub fn eval_call(
                          .map(|m| (m.as_method().unwrap().cloned(), m.ty())).next().unwrap();
             (method, Type::Unknown)
         } else {
-            let resolved = resolve::resolve_method(&func_symbol, call_tys.into_iter(), get_methods)?;
+            let resolved = resolve::resolve_method(&func_symbol, call_tys, get_methods)?;
             (resolved.data, resolved.ret_ty)
         };
 

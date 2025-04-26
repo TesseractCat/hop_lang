@@ -144,7 +144,34 @@ pub fn typecheck_call(
         env.get_function(env_key, &name.into()).unwrap_or(&[])
             .into_iter().cloned().map(|x| (x, ())).collect()
     };
-    resolve::resolve_method(func_symbol, args, get_methods_by_name)
+    let call_tys = args.collect::<Vec<_>>();
+    // If we're checking if we can call a function, first check if any of the type variables
+    // have the correct implementations
+    /*for (i, ty) in call_tys.iter().enumerate() {
+        match ty {
+            Type::TypeVariable { id, implements } => {
+                println!("TYPE VARIABLE {id} | {implements:?}");
+                let mut good = false;
+                if let Some(implements_node) = implements {
+                    let (_, list) = implements_node.as_typed().unwrap();
+                    let implements = list.as_list().unwrap().borrow();
+                    let implements = implements.iter().map(|i| i.as_implementation().unwrap());
+                    for imp in implements {
+                        if imp.func == *func_symbol.as_symbol().unwrap() {
+                            good = true;
+                            // Need to restrict the function using arg/ret types
+                        }
+                    }
+                }
+                if !good {
+                    return Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
+                }
+            }
+            _ => (),
+        }
+    }*/
+    // If so, we're safe to search for a matching method
+    resolve::resolve_method(func_symbol, call_tys, get_methods_by_name)
         .map(|x| x.ret_ty)
 }
 

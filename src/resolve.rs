@@ -1,9 +1,9 @@
 use std::{collections::HashMap, iter};
 
-use batsat::{lbool, BasicSolver, Lit, SolverInterface, Var};
+use batsat::{intmap::AsIndex, lbool, BasicSolver, Lit, SolverInterface, Var};
 use smol_str::SmolStr;
 
-use crate::{ast::{SpanNode, Type}, eval::EvalError};
+use crate::{ast::{Implementation, SpanNode, Type}, eval::EvalError};
 
 /// Recursively build SAT constraints to select exactly one implementation of `name`
 /// that takes as input the provided `call_tys`.
@@ -12,6 +12,7 @@ use crate::{ast::{SpanNode, Type}, eval::EvalError};
 fn add_match_constraints<T>(
     solver: &mut BasicSolver,
     type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
+    type_variable_impls: &mut HashMap<SmolStr, Vec<Implementation>>,
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
@@ -38,23 +39,14 @@ fn add_match_constraints<T>(
         method_vars.insert(v, method);
     }
 
-    // Exactly-one: OR(vars) and pairwise exclusion
-    solver.add_clause_reuse(
-        &mut method_vars.keys().copied().map(|v| Lit::new(v, true)).collect()
-    );
-    let vars: Vec<Var> = method_vars.keys().copied().collect();
-    for i in 0..vars.len() {
-        for j in (i+1)..vars.len() {
-            solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
-        }
-    }
-
     // Link parameters
     for (&mvar, (method, _)) in &method_vars {
+        println!("METHOD {method}");
         let (param_tys, ret_ty) = method.as_method().unwrap();
         let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
 
         for (i, param_ty) in param_tys.iter().chain(iter::once(&**ret_ty)).enumerate() {
+            // Allow dispatch on return type
             let actual = if i == call_tys.len() {
                 if let Some(ref ret_ty) = call_ret_ty {
                     ret_ty
@@ -67,23 +59,21 @@ fn add_match_constraints<T>(
             }; // The argument to the function
 
             match (param_ty, actual) {
-                (Type::TypeVariable { id: type_var_name, implements }, concrete) |
-                (concrete, Type::TypeVariable { id: type_var_name, implements })
+                (Type::TypeVariable { id: type_var_name, implements }, concrete)
                 if !matches!(concrete, Type::TypeVariable { .. })
                 => {
-                    let type_var_is_param = matches!(param_ty, Type::TypeVariable { .. });
                     println!("TVUS {type_var_name} = {concrete}");
 
                     let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
                     let type_var_id: SmolStr = if type_var_name == "_" {
-                        format!("anon{inside_method_idx}__{inside_method_var:?}").into()
+                        format!("anon{i}__{mvar:?}").into()
                     } else {
-                        format!("{type_var_name}__{inside_method_var:?}").into()
+                        format!("{type_var_name}__{mvar:?}").into()
                     };
 
                     // Bind the type variable to this concrete type under this method
                     let var_map = type_variables
-                        .entry(type_var_id)
+                        .entry(type_var_id.clone())
                         .or_insert_with(HashMap::new);
                     let bind_var = var_map
                         .entry(concrete.clone())
@@ -93,21 +83,29 @@ fn add_match_constraints<T>(
                         Lit::new(mvar, false),
                         Lit::new(*bind_var, true),
                     ]);
-                    // For all constraints on this type variable, recursively handle
-                    // m -> type_var_constraints_satisfied
-                    if let Some(implements_node) = implements {
-                        let (_, list) = implements_node.as_typed().unwrap();
-                        let implements = list.as_list().unwrap().borrow();
-                        let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                        for imp in implements {
+
+                    if let Type::TypeVariable { id, implements } = param_ty {
+                        if let Some(implements_node) = implements {
+                            let (_, list) = implements_node.as_typed().unwrap();
+                            let implements = list.as_list().unwrap().borrow();
+                            let implements = implements.iter().map(|i| i.as_implementation().unwrap());
+
+                            let impl_map = type_variable_impls
+                                .entry(type_var_id.clone())
+                                .or_insert_with(Vec::new);
+                            impl_map.extend(implements.cloned());
+                        }
+
+                        for imp in type_variable_impls.get(&type_var_id).cloned().unwrap_or_default() {
                             println!("RECURSING {}", imp.func);
                             let nested = add_match_constraints(
                                 solver,
                                 type_variables,
+                                type_variable_impls,
                                 &imp.func,
                                 &imp.params,
                                 Some(&*imp.ret),
-                                if type_var_is_param { Some((i, mvar)) } else { inside_method },
+                                Some((i, mvar)),
                                 get_methods_by_name
                             ).1;
                             // Require: if this method is chosen then nested must hold
@@ -115,6 +113,83 @@ fn add_match_constraints<T>(
                         }
                     }
                 },
+                (concrete, Type::TypeVariable { id: type_var_name, implements })
+                if !matches!(concrete, Type::TypeVariable { .. })
+                => {
+                    let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
+                    let type_var_id: SmolStr = if type_var_name == "_" {
+                        format!("anon{inside_method_idx}__{inside_method_var:?}").into()
+                    } else {
+                        format!("{type_var_name}__{inside_method_var:?}").into()
+                    };
+
+                    // Bind the type variable to this concrete type under this method
+                    let var_map = type_variables
+                        .entry(type_var_id.clone())
+                        .or_insert_with(HashMap::new);
+                    let bind_var = var_map
+                        .entry(concrete.clone())
+                        .or_insert_with(|| solver.new_var_default());
+                    // m -> binding_is_ty
+                    solver.add_clause_reuse(&mut vec![
+                        Lit::new(mvar, false),
+                        Lit::new(*bind_var, true),
+                    ]);
+
+                    println!("TVYOU {param_ty} | {actual}");
+                    // panic!("A type variable cannot be cast down to a concrete variable")
+                    let mut imp_vars: Vec<Var> = Vec::new();
+
+                    if let Some(implements_node) = implements {
+                        let (_, list) = implements_node.as_typed().unwrap();
+                        let implements = list.as_list().unwrap().borrow();
+                        let implements = implements.iter().map(|i| i.as_implementation().unwrap());
+
+                        let impl_map = type_variable_impls
+                            .entry(type_var_id.clone())
+                            .or_insert_with(Vec::new);
+                        impl_map.extend(implements.cloned());
+                    }
+
+                    for imp in type_variable_impls.get(&type_var_id).cloned().unwrap_or_default() {
+                        if name == imp.func {
+                            // Substitute the type variable for the concrete type
+                            let substituted_imp_params: Vec<_> = imp.params.iter().map(|p| match p {
+                                Type::TypeVariable { id, .. } if id == type_var_name => concrete,
+                                _ => p
+                            }).cloned().collect();
+                            let substituted_ret_ty = match &*imp.ret {
+                                Type::TypeVariable { id, .. } if id == type_var_name => concrete,
+                                _ => &*imp.ret
+                            };
+                            println!("SUBS: {substituted_imp_params:?} {substituted_ret_ty}");
+                            // Issue is that if this fails to find a match, the whole SAT fails (because of the or later) !!!
+                            // fixed?
+                            let nested = add_match_constraints(
+                                solver,
+                                type_variables,
+                                type_variable_impls,
+                                name,
+                                substituted_imp_params.as_slice(),
+                                Some(substituted_ret_ty),
+                                // &imp.params,
+                                // Some(&*imp.ret),
+                                inside_method,
+                                get_methods_by_name
+                            ).1;
+                            imp_vars.push(nested);
+                        }
+                    }
+
+                    // m -> one of these
+                    println!("IV: {imp_vars:?}");
+                    let mut or_clause = imp_vars.into_iter()
+                        .map(|v| Lit::new(v, true)).collect::<Vec<_>>();
+                    or_clause.push(Lit::new(mvar, false));
+                    solver.add_clause_reuse(&mut or_clause);
+
+                    //solver.add_clause_reuse(&mut vec![Lit::new(mvar, true)]);
+                }
                 (
                     Type::TypeVariable { id: type_var_lhs, implements: implements_lhs },
                     Type::TypeVariable { id: type_var_rhs, implements: implements_rhs }
@@ -136,29 +211,7 @@ fn add_match_constraints<T>(
                     // m -> unify lhs and rhs
                     unify_pairs.push((type_var_id_lhs, type_var_id_rhs));
 
-                    // Recurse for implementations
-                    for (i, implements) in [implements_lhs, implements_rhs].into_iter().enumerate() {
-                        let type_var_is_param = i == 0;
-                        if let Some(implements_node) = implements {
-                            let (_, list) = implements_node.as_typed().unwrap();
-                            let implements = list.as_list().unwrap().borrow();
-                            let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                            for imp in implements {
-                                println!("RECURSING {}", imp.func);
-                                let nested = add_match_constraints(
-                                    solver,
-                                    type_variables,
-                                    &imp.func,
-                                    &imp.params,
-                                    Some(&*imp.ret),
-                                    if type_var_is_param { Some((i, mvar)) } else { inside_method },
-                                    get_methods_by_name
-                                ).1;
-                                // Require: if this method is chosen then nested must hold
-                                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                            }
-                        }
-                    }
+                    // TODO: Call-side constraints must be superset of param-side constraints
                 }
                 (lhs, rhs) => {
                     // Exclude mismatched concrete types
@@ -166,6 +219,7 @@ fn add_match_constraints<T>(
                     if !lhs.compatible(rhs) {
                         // Exclude this method
                         solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                        println!("EXCLUDED!!! {lhs} vs. {rhs}");
                     }
                 }
             }
@@ -194,6 +248,17 @@ fn add_match_constraints<T>(
         }
     }
 
+    // Exactly-one: OR(vars) and pairwise exclusion
+    // solver.add_clause_reuse(
+    //     &mut method_vars.keys().copied().map(|v| Lit::new(v, true)).collect()
+    // );
+    let vars: Vec<Var> = method_vars.keys().copied().collect();
+    for i in 0..vars.len() {
+        for j in (i+1)..vars.len() {
+            solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
+        }
+    }
+
     // SAT var for "some method holds"
     let sat_var = solver.new_var_default();
     // sat_var -> OR(method_vars)
@@ -217,18 +282,19 @@ pub struct MethodResolution<T> {
 
 pub fn resolve_method<T>(
     func: &SpanNode,
-    call_tys: impl Iterator<Item = Type>,
+    call_tys: Vec<Type>,
     get_methods_by_name: impl Fn(&str) -> Vec<(Type, T)>
 ) -> Result<MethodResolution<T>, EvalError> {
     let func_name = func.as_symbol().unwrap();
-    let call_tys: Vec<_> = call_tys.collect();
     let mut solver = BasicSolver::default();
     let mut type_variables = HashMap::new();
+    let mut type_variable_impls = HashMap::new();
 
     // Build constraints for `func` just like an `imp` resolution
     let (method_vars, sat) = add_match_constraints(
         &mut solver,
         &mut type_variables,
+        &mut type_variable_impls,
         func_name,
         &call_tys,
         None,
@@ -289,6 +355,7 @@ pub fn resolve_method<T>(
     };
 
     println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
+    println!(" - IMPLS = {type_variable_impls:?}");
     println!(" - RETURN TYPE = {ret_ty}");
 
     Ok(MethodResolution {

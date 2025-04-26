@@ -9,7 +9,7 @@ use std::{cell::RefCell, collections::HashMap, env, fs, hash::Hash, io::BufWrite
 mod tokenize;
 use tokenize::{parse_block, Token};
 mod ast;
-use ast::{Implementation, Method, Node, NodeValue, Reference, SpanNode, Type};
+use ast::{Implementation, Method, MethodTy, Node, NodeValue, Reference, SpanNode, Type};
 mod eval;
 use eval::{eval, eval_call};
 mod resolve;
@@ -263,7 +263,7 @@ fn typecheck(
                         return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
                     }
 
-                    let method_ty = Type::Method { params: param_tys, ret: Box::new(ret_ty) };
+                    let method_ty = Type::Method(ast::MethodTy { params: param_tys, ret: Box::new(ret_ty) });
 
                     Ok(method_ty)
                 },
@@ -570,12 +570,12 @@ fn main() {
             Ok(eval(node.clone(), env, env_key)?.into_type().unwrap())
         };
 
-        let func_ty = Type::Method {
+        let func_ty = Type::Method(MethodTy {
             params: params.values().map(|v| parse_param_type(v)).collect::<Result<_, _>>()?,
             ret: Box::new(ret_ty.into_type().map_err(|n| {
                 EvalError::TypeMismatch { expected: "Type".to_string(), got: n.ty(), span: n.tag }
             })?)
-        };
+        });
         Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
             param_names: params.keys().cloned().map(|n| n.into_keyword().unwrap()).collect(),
             def_env_key: env_key, body: Box::new(block), ty: func_ty
@@ -608,8 +608,10 @@ fn main() {
 
         let imp = Implementation {
             func: func_name,
-            params: param_types,
-            ret: Box::new(ret_type)
+            method: MethodTy {
+                params: param_types,
+                ret: Box::new(ret_type)
+            }
         };
 
         //Ok(Node::new_type(Default::default(), Type::Implements(implementations)))
@@ -623,46 +625,46 @@ fn main() {
         let b = args.next().unwrap().into_string()
             .map_err(|n| EvalError::TypeMismatch { expected: "String".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_string(Default::default(), (a.to_string() + b.as_str()).into()))
-    }), Type::Method { params: vec![Type::String, Type::String], ret: Box::new(Type::String) });
+    }), MethodTy { params: vec![Type::String, Type::String], ret: Box::new(Type::String) });
     runtime_env.global_def_rust_method("+".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a + b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    }), MethodTy { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
     runtime_env.global_def_rust_method("-".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_number(Default::default(), a - b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    }), MethodTy { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
     runtime_env.global_def_rust_method("lt".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a < b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
+    }), MethodTy { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Number) });
     runtime_env.global_def_rust_method("=".into(), Box::new(|mut args, env, env_key| {
         let a = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         let b = args.next().unwrap().into_number()
             .map_err(|n| EvalError::TypeMismatch { expected: "Number".to_string(), got: n.ty(), span: n.tag })?;
         Ok(Node::new_bool(Default::default(), a == b))
-    }), Type::Method { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
+    }), MethodTy { params: vec![Type::Number, Type::Number], ret: Box::new(Type::Bool) });
     runtime_env.global_def_rust_method("refeq".into(), Box::new(|mut args, env, env_key| {
         let a = eval(args.next().unwrap(), env, env_key)?;
         let b = eval(args.next().unwrap(), env, env_key)?;
         Ok(Node::new_bool(Default::default(), a == b))
-    }), Type::Method { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
+    }), MethodTy { params: vec![Type::Any, Type::Any], ret: Box::new(Type::Bool) });
     let out = Rc::new(RefCell::new(BufWriter::new(std::io::stdout())));
     runtime_env.global_def_rust_method("print".into(), Box::new(move |mut args, env, env_key| {
         let value = args.next().unwrap();
         println!("{value}");
         Ok(value)
-    }), Type::Method { params: vec![Type::Any], ret: Box::new(Type::Any) });
+    }), MethodTy { params: vec![Type::Any], ret: Box::new(Type::Any) });
     runtime_env.global_def_rust_method("struct".into(), Box::new(|mut args, env, env_key| {
         let structure = args.next().unwrap();
         assert!(structure.is_table());
@@ -670,21 +672,21 @@ fn main() {
         Ok(Node::new_type(Default::default(), Type::Struct(
             Box::new(structure)
         )))
-    }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
+    }), MethodTy { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
     runtime_env.global_def_rust_method("enum".into(), Box::new(|mut args, env, env_key| {
         let enumeration = args.next().unwrap();
 
         Ok(Node::new_type(Default::default(), Type::Enum(
             Box::new(enumeration)
         )))
-    }), Type::Method { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
+    }), MethodTy { params: vec![Type::UntypedTable], ret: Box::new(Type::Type(None)) });
     /*global_env.def_rust_method("List".into(), Box::new(|mut args, env| {
         let ty = args.next().unwrap();
 
         Ok(Node::new_type(Default::default(), Type::List(
             Box::new(ty.into_type().unwrap())
         )))
-    }), Type::Method { params: vec![Type::Type], ret: Box::new(Type::Type) });*/
+    }), MethodTy { params: vec![Type::Type], ret: Box::new(Type::Type) });*/
 
     // Macros
     runtime_env.global_def_rust_macro("def!".into(), Box::new(|mut args, env, env_key| {

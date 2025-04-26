@@ -6,7 +6,7 @@ use slotmap::{new_key_type, SlotMap};
 use smol_str::SmolStr;
 use thiserror::Error;
 
-use crate::{ast::{Callback, Method, Node, NodeValue, Reference, SpanNode, Type}, resolve};
+use crate::{ast::{Callback, Method, MethodTy, Node, NodeValue, Reference, SpanNode, Type}, resolve};
 
 #[derive(Error, Debug)]
 pub enum EvalError {
@@ -147,8 +147,8 @@ impl Environment {
         self.def_rust_method(current, name, value, Type::SpecialForm);
     }
 
-    pub fn global_def_rust_method(&mut self, name: SmolStr, value: Box<Callback>, ty: Type) {
-        self.def_rust_method(self.global, name, value, ty);
+    pub fn global_def_rust_method(&mut self, name: SmolStr, value: Box<Callback>, ty: MethodTy) {
+        self.def_rust_method(self.global, name, value, Type::Method(ty));
     }
     pub fn global_def_rust_macro(&mut self, name: SmolStr, value: Box<Callback>) {
         self.def_rust_macro(self.global, name, value);
@@ -221,7 +221,7 @@ pub fn eval_call(
             (method, Type::Unknown)
         } else {
             let resolved = resolve::resolve_method(&func_symbol, call_tys, get_methods)?;
-            (resolved.data, resolved.ret_ty)
+            (resolved.data.expect("Encountered abstract function resolution at eval time"), resolved.ret_ty)
         };
 
         match &*method.borrow() {

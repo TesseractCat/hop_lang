@@ -8,10 +8,14 @@ use smol_str::SmolStr;
 use crate::eval::{Environment, EnvironmentKey, EvalError};
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct Implementation {
-    pub func: SmolStr,
+pub struct MethodTy {
     pub params: Vec<Type>,
     pub ret: Box<Type>
+}
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct Implementation {
+    pub func: SmolStr,
+    pub method: MethodTy
 }
 #[derive(Debug, PartialEq, Eq, Clone, EnumAsInner, Hash)]
 pub enum Type {
@@ -35,10 +39,7 @@ pub enum Type {
     Table(Box<Type>, Box<Type>),
 
     Function, // List of methods
-    Method {
-        params: Vec<Type>,
-        ret: Box<Type>
-    },
+    Method(MethodTy),
     Macro,
     SpecialForm,
 
@@ -47,19 +48,38 @@ pub enum Type {
 }
 impl Type {
     pub fn compatible(self: &Type, rhs: &Type) -> bool {
-        // Compatibility such that rhs can be used in place of self
+        // Compatibility such that rhs can be used in place of self/lhs
 
         // Strict equality
         if self == rhs { return true; }
 
         // More complicated cases
-        match rhs {
-            Self::Any | Self::Unknown => return true,
-            _ => ()
-        };
-        match self {
-            Self::Any | Self::Unknown => true,
-            Self::Type(_) if matches!(rhs, Type::Type(_)) => true,
+        // lhs \subseteq rhs
+        match (self, rhs) {
+            (_, Self::Any | Self::Unknown) | (Self::Any | Self::Unknown, _) => true,
+            (Self::Type(_), Self::Type(_)) => true,
+            (Self::UntypedList, Self::List(_)) => true,
+            (
+                Self::TypeVariable { implements: imp_lhs, .. },
+                Self::TypeVariable { implements: imp_rhs, .. }
+            ) => {
+                if let Some(imp_lhs_node) = imp_lhs {
+                    if let Some(imp_rhs_node) = imp_rhs {
+                        let (_, list) = imp_lhs_node.as_typed().unwrap();
+                        let implements = list.as_list().unwrap().borrow();
+                        let imp_lhs = implements.iter().map(|i| i.as_implementation().unwrap());
+                        let (_, list) = imp_rhs_node.as_typed().unwrap();
+                        let implements = list.as_list().unwrap().borrow();
+                        let imp_rhs = implements.iter().map(|i| i.as_implementation().unwrap());
+                        todo!("TV advanced compatibility")
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            },
+            (_, _) => false
             /*Self::Implements(imp_lhs) if matches!(rhs, Self::Implements(_)) => {
                 if let Self::Implements(imp_rhs) = rhs {
                     // imp_lhs \subseteq imp_rhs
@@ -158,11 +178,6 @@ impl Type {
                 }
                 true
             },*/
-            Self::UntypedList => match rhs {
-                Self::UntypedList | Self::List(_) => true,
-                _ => false
-            },
-            _ => false
         }
     }
 }
@@ -176,7 +191,7 @@ impl Display for Type {
                 }
                 Ok(())
             },
-            Type::Method { params, ret } => {
+            Type::Method(MethodTy { params, ret }) => {
                 for p in params {
                     write!(f, "{p} ")?;
                 }
@@ -243,7 +258,7 @@ impl Debug for Method {
             Self::Hop { ty, .. } | Self::Rust { ty, ..} => {
                 if let Some(ty) = ty.as_method() {
                     write!(f, "method(")?;
-                    let mut it = ty.0.iter().peekable();
+                    let mut it = ty.params.iter().peekable();
                     while let Some(item) = it.next() {
                         if it.peek().is_none() {
                             write!(f, "{}", item)?;
@@ -251,7 +266,7 @@ impl Debug for Method {
                             write!(f, "{} ", item)?;
                         }
                     }
-                    write!(f, ") -> {}", ty.1)
+                    write!(f, ") -> {}", ty.ret)
                 } else {
                     write!(f, "method(?) -> ?")
                 }
@@ -352,7 +367,7 @@ impl<T: Clone> Display for NodeValue<T> {
             Self::Typed(ty, node) => {
                 write!(f, "<{ty}>/{node}")
             },
-            Self::Implementation(Implementation { func, params, ret }) => {
+            Self::Implementation(Implementation { func, method: MethodTy { params, ret } }) => {
                 write!(f, "[IMP ({func}")?;
                 for p in params.iter() {
                     write!(f, " {p}")?;

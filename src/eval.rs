@@ -148,7 +148,7 @@ impl Environment {
     }
 
     pub fn global_def_rust_method(&mut self, name: SmolStr, value: Box<Callback>, ty: MethodTy) {
-        self.def_rust_method(self.global, name, value, Type::Method(ty));
+        self.def_rust_method(self.global, name, value, Type::Method(ty, 0));
     }
     pub fn global_def_rust_macro(&mut self, name: SmolStr, value: Box<Callback>) {
         self.def_rust_macro(self.global, name, value);
@@ -371,13 +371,9 @@ pub fn eval_call(
                 for imp in &imp_list {
                     assert!(imp.is_implementation());
                 }
-                let imp_list = Node::new_typed(
-                    func.tag.clone(), Type::List(Box::new(Type::Implementation)),
-                    SpanNode::new_list(func.tag.clone(), Reference::new(imp_list))
-                );
                 Ok(SpanNode::new_type(func.tag, Type::TypeVariable {
                     id,
-                    implements: Some(Box::new(imp_list))
+                    implements: Some(imp_list.into_iter().map(|i| i.into_implementation().unwrap()).collect())
                 }))
             },
             _ => todo!()

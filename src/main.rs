@@ -14,6 +14,16 @@ mod eval;
 use eval::{eval, eval_call};
 mod resolve;
 
+thread_local! {
+    static METHOD_COUNTER: RefCell<u64> = RefCell::new(1);
+}
+pub fn get_new_method_id() -> u64 {
+    METHOD_COUNTER.with(|counter| {
+        *counter.borrow_mut() += 1;
+        *counter.borrow()
+    })
+}
+
 new_key_type! { pub struct TypeEnvironmentKey; }
 #[derive(Default, Debug, PartialEq)]
 pub struct TypeEnvironmentScope {
@@ -250,20 +260,26 @@ fn typecheck(
                     let param_tys: Vec<Type> = params.as_table().unwrap().borrow().values().map(|v| v.as_type().unwrap().clone()).collect();
                     let ret_ty = ret.into_type().map_err(|e| EvalError::TypeMismatch { expected: "Type".into(), got: e.ty(), span: e.tag })?;
 
+                    let method_ty = Type::Method(MethodTy {
+                        params: param_tys, ret: Box::new(ret_ty)
+                    }, get_new_method_id());
+                    let method_ty = resolve::rename_tv_names(method_ty);
+
                     // Recurse typecheck function body
-                    let new_env_key = env.new_child(env_key);
-                    for (param_name, param_ty) in param_names.iter().zip(param_tys.iter()) {
-                        //println!("Setting function env {param_name} = {param_ty}");
-                        env.set(new_env_key, param_name.clone(), param_ty.clone(), true);
+                    {
+                        let method_ty = method_ty.as_method().unwrap().0;
+                        let new_env_key = env.new_child(env_key);
+                        for (param_name, param_ty) in param_names.iter().zip(method_ty.params.iter()) {
+                            //println!("Setting function env {param_name} = {param_ty}");
+                            env.set(new_env_key, param_name.clone(), param_ty.clone(), true);
+                        }
+    
+                        let body = list.next().unwrap();
+                        let body_ty = typecheck(body, env, new_env_key)?;
+                        if !method_ty.ret.compatible(&body_ty) {
+                            return Err(EvalError::TypeMismatch { expected: format!("{}", method_ty.ret), got: body_ty, span: body.tag.clone() });
+                        }
                     }
-
-                    let body = list.next().unwrap();
-                    let body_ty = typecheck(body, env, new_env_key)?;
-                    if !ret_ty.compatible(&body_ty) {
-                        return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
-                    }
-
-                    let method_ty = Type::Method(ast::MethodTy { params: param_tys, ret: Box::new(ret_ty) });
 
                     Ok(method_ty)
                 },
@@ -575,7 +591,8 @@ fn main() {
             ret: Box::new(ret_ty.into_type().map_err(|n| {
                 EvalError::TypeMismatch { expected: "Type".to_string(), got: n.ty(), span: n.tag }
             })?)
-        });
+        }, get_new_method_id());
+        let func_ty = resolve::rename_tv_names(func_ty);
         Ok(Node::new_method(block.tag.clone(), Reference::new(Method::Hop {
             param_names: params.keys().cloned().map(|n| n.into_keyword().unwrap()).collect(),
             def_env_key: env_key, body: Box::new(block), ty: func_ty

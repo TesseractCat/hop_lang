@@ -12,15 +12,28 @@ pub struct MethodTy {
     pub params: Vec<Type>,
     pub ret: Box<Type>
 }
+impl Display for MethodTy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for p in &self.params {
+            write!(f, "{p} ")?;
+        }
+        write!(f, "-> {}", self.ret)
+    }
+}
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Implementation {
     pub func: SmolStr,
     pub method: MethodTy
 }
+impl Display for Implementation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(imp {} {})", self.func, self.method)
+    }
+}
 #[derive(Debug, PartialEq, Eq, Clone, EnumAsInner, Hash)]
 pub enum Type {
     Type(Option<Box<Type>>),
-    TypeVariable { id: SmolStr, implements: Option<Box<SpanNode>> },
+    TypeVariable { id: SmolStr, implements: Option<Vec<Implementation>> },
     Implementation,
 
     Unit,
@@ -39,7 +52,7 @@ pub enum Type {
     Table(Box<Type>, Box<Type>),
 
     Function, // List of methods
-    Method(MethodTy),
+    Method(MethodTy, u64),
     Macro,
     SpecialForm,
 
@@ -63,14 +76,8 @@ impl Type {
                 Self::TypeVariable { implements: imp_lhs, .. },
                 Self::TypeVariable { implements: imp_rhs, .. }
             ) => {
-                if let Some(imp_lhs_node) = imp_lhs {
-                    if let Some(imp_rhs_node) = imp_rhs {
-                        let (_, list) = imp_lhs_node.as_typed().unwrap();
-                        let implements = list.as_list().unwrap().borrow();
-                        let imp_lhs = implements.iter().map(|i| i.as_implementation().unwrap());
-                        let (_, list) = imp_rhs_node.as_typed().unwrap();
-                        let implements = list.as_list().unwrap().borrow();
-                        let imp_rhs = implements.iter().map(|i| i.as_implementation().unwrap());
+                if let Some(imp_lhs) = imp_lhs {
+                    if let Some(imp_rhs) = imp_rhs {
                         todo!("TV advanced compatibility")
                     } else {
                         false
@@ -185,17 +192,18 @@ impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Type::TypeVariable { id, implements } => {
-                write!(f, "'{id}")?;
+                write!(f, "<'{id}")?;
                 if let Some(imp) = implements {
-                    write!(f, " | {imp}")?;
+                    write!(f, " | [ ")?;
+                    for i in imp {
+                        write!(f, "{i} ")?;
+                    }
+                    write!(f, "]>")?;
                 }
                 Ok(())
             },
-            Type::Method(MethodTy { params, ret }) => {
-                for p in params {
-                    write!(f, "{p} ")?;
-                }
-                write!(f, "-> {ret}")
+            Type::Method(ty, _) => {
+                write!(f, "{ty}")
             },
             _ => write!(f, "{self:?}")
         }
@@ -258,7 +266,7 @@ impl Debug for Method {
             Self::Hop { ty, .. } | Self::Rust { ty, ..} => {
                 if let Some(ty) = ty.as_method() {
                     write!(f, "method(")?;
-                    let mut it = ty.params.iter().peekable();
+                    let mut it = ty.0.params.iter().peekable();
                     while let Some(item) = it.next() {
                         if it.peek().is_none() {
                             write!(f, "{}", item)?;
@@ -266,7 +274,7 @@ impl Debug for Method {
                             write!(f, "{} ", item)?;
                         }
                     }
-                    write!(f, ") -> {}", ty.ret)
+                    write!(f, ") -> {}", ty.0.ret)
                 } else {
                     write!(f, "method(?) -> ?")
                 }
@@ -468,5 +476,8 @@ impl<T: Clone> Node<T> {
     }
     pub fn into_typed(self) -> Result<(Type, Box<Self>), Node<T>> {
         self.node.into_typed().map_err(|val| Self { tag: self.tag, node: val })
+    }
+    pub fn into_implementation(self) -> Result<Implementation, Node<T>> {
+        self.node.into_implementation().map_err(|val| Self { tag: self.tag, node: val })
     }
 }

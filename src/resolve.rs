@@ -5,6 +5,45 @@ use smol_str::SmolStr;
 
 use crate::{ast::{Implementation, MethodTy, SpanNode, Type}, eval::EvalError};
 
+fn rename_tv_names_helper(func: u64, mut method: MethodTy, idx: Option<usize>) -> MethodTy {
+    for (i, ty) in method.params.iter_mut().chain(iter::once(&mut *method.ret)).enumerate() {
+        match ty {
+            Type::TypeVariable { id, implements } => {
+                if let Some(implements) = implements {
+                    for imp in implements.iter_mut() {
+                        imp.method = rename_tv_names_helper(
+                            func,
+                            std::mem::replace(&mut imp.method, MethodTy {
+                                params: vec![], ret: Box::new(Type::Unit)
+                            }),
+                            Some(i)
+                        );
+                    }
+                }
+                let id = if id == "_" {
+                    format!("{func}__anon{}", idx.unwrap_or(i)).into()
+                } else {
+                    format!("{func}__{id}").into()
+                };
+                let implements = std::mem::replace(implements, None);
+                let _ = std::mem::replace(
+                    ty,
+                    Type::TypeVariable { id, implements }
+                );
+            }
+            _ => ()
+        }
+    }
+    method
+}
+pub fn rename_tv_names(method: Type) -> Type {
+    let method_id = *method.as_method().unwrap().1;
+    Type::Method(
+        rename_tv_names_helper(method_id, method.into_method().unwrap().0, None),
+        method_id
+    )
+}
+
 /// Recursively build SAT constraints to select exactly one implementation of `name`
 /// that takes as input the provided `call_tys`.
 /// Returns a map of method vars to their Types, and a fresh `sat_var`
@@ -16,15 +55,16 @@ fn add_match_constraints<T>(
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
-    inside_method: Option<(usize, Var)>,
-    get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>
+    get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>,
+    inside_imp: bool
 ) -> (HashMap<Var, (Type, Option<T>)>, Var) {
     println!("{name} | {call_tys:?} {call_ret_ty:?}");
     // Gather candidate methods
     let methods = get_methods_by_name(name)
         .into_iter()
         // filter by arity
-        .filter(|m| m.0.as_method().unwrap().params.len() == call_tys.len())
+        .filter(|m| m.0.as_method().unwrap().0.params.len() == call_tys.len())
+        //.map(|m| (rename_tv_names(m.0), m.1))
         .collect::<Vec<_>>();
     if methods.is_empty() {
         let sat_var = solver.new_var_default();
@@ -41,11 +81,8 @@ fn add_match_constraints<T>(
 
     let impls: Vec<Implementation> = call_tys.iter().filter_map(|ty| {
         match ty {
-            Type::TypeVariable { implements: Some(implements_node), .. } => {
-                let (_, list) = implements_node.as_typed().unwrap();
-                let implements = list.as_list().unwrap().borrow();
-                let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                Some(implements.cloned().collect::<Vec<_>>())
+            Type::TypeVariable { implements: Some(implements), .. } => {
+                Some(implements.iter().cloned().collect::<Vec<_>>())
             },
             _ => None
         }
@@ -53,14 +90,14 @@ fn add_match_constraints<T>(
     for imp in impls {
         if imp.func == name {
             let v = solver.new_var_default();
-            method_vars.insert(v, (Type::Method(imp.method), None));
+            method_vars.insert(v, (Type::Method(imp.method, 0), None));
         }
     }
 
     // Link parameters
     for (&mvar, (method, _)) in &method_vars {
         println!("METHOD {method}");
-        let MethodTy { params: param_tys, ret: ret_ty } = method.as_method().unwrap();
+        let MethodTy { params: param_tys, ret: ret_ty } = method.as_method().unwrap().0;
         let mut unify_pairs: Vec<(SmolStr, SmolStr)> = Vec::new();
 
         for (i, param_ty) in param_tys.iter().chain(iter::once(&**ret_ty)).enumerate() {
@@ -82,16 +119,9 @@ fn add_match_constraints<T>(
                 => {
                     println!("TVUS {type_var_name} = {concrete}");
 
-                    let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
-                    let type_var_id: SmolStr = if type_var_name == "_" {
-                        format!("anon{i}__{mvar:?}").into()
-                    } else {
-                        format!("{type_var_name}__{mvar:?}").into()
-                    };
-
                     // Bind the type variable to this concrete type under this method
                     let var_map = type_variables
-                        .entry(type_var_id.clone())
+                        .entry(type_var_name.clone())
                         .or_insert_with(HashMap::new);
                     let bind_var = var_map
                         .entry(concrete.clone())
@@ -103,18 +133,14 @@ fn add_match_constraints<T>(
                     ]);
 
                     if let Type::TypeVariable { id, implements } = param_ty {
-                        if let Some(implements_node) = implements {
-                            let (_, list) = implements_node.as_typed().unwrap();
-                            let implements = list.as_list().unwrap().borrow();
-                            let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-
+                        if let Some(implements) = implements {
                             let impl_map = type_variable_impls
-                                .entry(type_var_id.clone())
+                                .entry(type_var_name.clone())
                                 .or_insert_with(Vec::new);
-                            impl_map.extend(implements.cloned());
+                            impl_map.extend(implements.iter().cloned());
                         }
 
-                        for imp in type_variable_impls.get(&type_var_id).cloned().unwrap_or_default() {
+                        for imp in type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
                             println!("RECURSING {}", imp.func);
                             let nested = add_match_constraints(
                                 solver,
@@ -123,8 +149,8 @@ fn add_match_constraints<T>(
                                 &imp.func,
                                 &imp.method.params,
                                 Some(&*imp.method.ret),
-                                Some((i, mvar)),
-                                get_methods_by_name
+                                get_methods_by_name,
+                                true
                             ).1;
                             // Require: if this method is chosen then nested must hold
                             solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
@@ -134,7 +160,26 @@ fn add_match_constraints<T>(
                 (concrete, Type::TypeVariable { id: type_var_name, implements })
                 if !matches!(concrete, Type::TypeVariable { .. })
                 => {
-                    solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                    // Bind the type variable to this concrete type under this method
+                    if inside_imp {
+                        let var_map = type_variables
+                            .entry(type_var_name.clone())
+                            .or_insert_with(HashMap::new);
+                        let bind_var = var_map
+                            .entry(concrete.clone())
+                            .or_insert_with(|| solver.new_var_default());
+                        // m -> binding_is_ty
+                        solver.add_clause_reuse(&mut vec![
+                            Lit::new(mvar, false),
+                            Lit::new(*bind_var, true),
+                        ]);
+                    } else {
+                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                    }
+
+                    // println!("EXCLUDED! c <-> TV");
+                    // solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+
                     /*let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
                     let type_var_id: SmolStr = if type_var_name == "_" {
                         format!("anon{inside_method_idx}__{inside_method_var:?}").into()
@@ -216,24 +261,13 @@ fn add_match_constraints<T>(
                 ) => {
                     // let type_var_id_lhs: SmolStr = format!("{type_var_lhs}__{mvar:?}").into();
                     // let type_var_id_rhs: SmolStr = format!("{type_var_rhs}__{:?}", inside_method.unwrap()).into();
-                    let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
-                    let type_var_id_lhs: SmolStr = if type_var_lhs == "_" {
-                        format!("anon{i}__{mvar:?}").into()
-                    } else {
-                        format!("{type_var_lhs}__{mvar:?}").into()
-                    };
-                    let type_var_id_rhs: SmolStr = if type_var_rhs == "_" {
-                        format!("anon{inside_method_idx}__{inside_method_var:?}").into()
-                    } else {
-                        format!("{type_var_rhs}__{inside_method_var:?}").into()
-                    };
 
-                    // Bind the type variable to this concrete type under this method
+                    // Bind the type variable to this TV type under this method
                     let var_map = type_variables
-                        .entry(type_var_id_lhs.clone())
+                        .entry(type_var_lhs.clone())
                         .or_insert_with(HashMap::new);
                     let bind_var = var_map
-                        .entry(Type::TypeVariable { id: type_var_id_rhs.clone(), implements: None })
+                        .entry(Type::TypeVariable { id: type_var_rhs.clone(), implements: None })
                         .or_insert_with(|| solver.new_var_default());
                     // m -> binding_is_ty
                     solver.add_clause_reuse(&mut vec![
@@ -242,8 +276,10 @@ fn add_match_constraints<T>(
                     ]);
                     
                     // m -> unify lhs and rhs
-                    unify_pairs.push((type_var_id_lhs, type_var_id_rhs));
-
+                    if type_var_lhs != type_var_rhs {
+                        unify_pairs.push((type_var_lhs.clone(), type_var_rhs.clone()));
+                    }
+                    
                     if !param_ty.compatible(actual) {
                         // Exclude this method
                         solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
@@ -327,6 +363,12 @@ pub fn resolve_method<T>(
     let mut type_variables = HashMap::new();
     let mut type_variable_impls = HashMap::new();
 
+    /*let freshened_func = Type::Method(MethodTy {
+        params: call_tys, ret: Box::new(Type::Unit)
+    });
+    let freshened_func = rename_tv_names(func_name.as_str(), freshened_func);
+    let call_tys = freshened_func.into_method().unwrap().params;*/
+
     // Build constraints for `func` just like an `imp` resolution
     let (method_vars, sat) = add_match_constraints(
         &mut solver,
@@ -335,8 +377,8 @@ pub fn resolve_method<T>(
         func_name,
         &call_tys,
         None,
-        None,
-        &get_methods_by_name
+        &get_methods_by_name,
+        false
     );
 
     // XOR(type variable bindings)
@@ -375,18 +417,13 @@ pub fn resolve_method<T>(
         }
     }
 
-    let chosen_method = chosen_method_ty.0.as_method().unwrap();
+    let chosen_method = chosen_method_ty.0.as_method().unwrap().0;
     let unresolved_ret_ty = (*chosen_method.ret).clone();
     let ret_ty = match unresolved_ret_ty {
         Type::TypeVariable { id: type_var_name, .. } => {
-            let i = chosen_method.params.len();
-            let type_var_id: SmolStr = if type_var_name == "_" {
-                format!("anon{i}__{chosen_method_var:?}").into()
-            } else {
-                format!("{type_var_name}__{chosen_method_var:?}").into()
-            };
             // FIXME: If this panics, that means that we haven't resolved the return type
-            concrete_type_variables[&type_var_id].clone()
+            concrete_type_variables.get(&type_var_name)
+                .expect(&format!("Failed to find return type for {type_var_name}")).clone()
         },
         _ => unresolved_ret_ty
     };

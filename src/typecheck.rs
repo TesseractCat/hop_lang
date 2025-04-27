@@ -194,9 +194,10 @@ pub fn typecheck(
             
             match builtin {
                 Some("do") => {
-                    let mut last = Type::UntypedList;
+                    let mut last = Type::Unit;
+                    let new_env_key = env.new_child(env_key);
                     while let Some(elem) = list.next() {
-                        last = typecheck(elem, env, env_key)?;
+                        last = typecheck(elem, env, new_env_key)?;
                     }
                     Ok(last)
                 },

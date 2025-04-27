@@ -1,5 +1,5 @@
-/*// Concrete types
-def! foo [x: Number, y: String] -> Number { x };
+// Concrete types
+/*def! foo [x: Number, y: String] -> Number { x };
 print (foo 2 "hi");
 
 // Unconstrained generic
@@ -9,14 +9,18 @@ print (identity "meow");
 
 // Function that returns generic
 def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
-print (twice 3);
+print (twice 3);*/
 
 // :eyes:
-//def! fourtimes [x: 'a (imp twice ('a (imp + 'a 'a -> 'a)) -> 'a)] -> 'a { twice (twice x) };
 //def! fourtimes [x: 'a (imp twice 'a -> 'a)] -> 'a { twice (twice x) };
-//print (fourtimes 5);*/
+//def! fourtimes [x: 'a (imp twice ('a (imp + 'a 'a -> 'a)) -> 'a)] -> 'a { twice (twice x) };
+//def! fourtimes [x: 'a (imp twice 'a -> 'a) (imp + 'a String -> String)] -> 'a { twice (twice x) };
+def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+def! fourtimes [x: 'a (imp twice ('a (imp + 'a String -> String)) -> 'a)] -> 'a { twice (twice x) };
+print (fourtimes 5);
++ 1 "hi";
 
 // Shouldn't work
-def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
-def! fourtimes [x: '_ (imp twice '_ -> '_)] -> '_ { twice (twice x) };
-print (+ (fourtimes 2) 2);
+//def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+//def! fourtimes [x: '_ (imp twice '_ -> '_)] -> ('_ (imp + '_ Number -> Number)) { twice (twice x) };
+//print (+ (fourtimes 2) 2);

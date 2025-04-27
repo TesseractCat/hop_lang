@@ -1,4 +1,4 @@
-use std::{collections::HashMap, iter};
+use std::{collections::{HashMap, HashSet}, iter};
 
 use batsat::{intmap::AsIndex, lbool, BasicSolver, Lit, SolverInterface, Var};
 use smol_str::SmolStr;
@@ -44,6 +44,26 @@ pub fn rename_tv_names(method: Type) -> Type {
     )
 }
 
+fn flatten_impls_helper(method: &MethodTy, dict: &mut HashMap<SmolStr, HashSet<Implementation>>) {
+    for p in &method.params {
+        if let Type::TypeVariable { id, implements } = p {
+            dict.entry(id.clone())
+                .or_insert_with(Default::default)
+                .extend(implements.as_ref().map(|x| x.as_slice()).unwrap_or(&[]).iter().cloned());
+            if let Some(implements) = implements {
+                for imp in implements.iter() {
+                    flatten_impls_helper(&imp.method, dict);
+                }
+            }
+        }
+    }
+}
+pub fn flatten_impls(method: &MethodTy) -> HashMap<SmolStr, HashSet<Implementation>> {
+    let mut dict = HashMap::new();
+    flatten_impls_helper(method, &mut dict);
+    dict
+}
+
 /// Recursively build SAT constraints to select exactly one implementation of `name`
 /// that takes as input the provided `call_tys`.
 /// Returns a map of method vars to their Types, and a fresh `sat_var`
@@ -51,7 +71,7 @@ pub fn rename_tv_names(method: Type) -> Type {
 fn add_match_constraints<T>(
     solver: &mut BasicSolver,
     type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
-    type_variable_impls: &mut HashMap<SmolStr, Vec<Implementation>>,
+    type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>,
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
@@ -136,7 +156,7 @@ fn add_match_constraints<T>(
                         if let Some(implements) = implements {
                             let impl_map = type_variable_impls
                                 .entry(type_var_name.clone())
-                                .or_insert_with(Vec::new);
+                                .or_insert_with(Default::default);
                             impl_map.extend(implements.iter().cloned());
                         }
 
@@ -186,17 +206,38 @@ fn add_match_constraints<T>(
                     if type_var_lhs != type_var_rhs {
                         unify_pairs.push((type_var_lhs.clone(), type_var_rhs.clone()));
                     }
+
+                    if let Some(implements) = implements_lhs {
+                        let impl_map = type_variable_impls
+                            .entry(type_var_lhs.clone())
+                            .or_insert_with(Default::default);
+                        impl_map.extend(implements.iter().cloned());
+                    }
+                    if let Some(implements) = implements_rhs {
+                        let impl_map = type_variable_impls
+                            .entry(type_var_rhs.clone())
+                            .or_insert_with(Default::default);
+                        impl_map.extend(implements.iter().cloned());
+                    }
                     
                     println!(" === {param_ty} vs. {actual}");
                     if inside_imp {
-                        if let Some(implements) = implements_lhs {
-                            let impl_map = type_variable_impls
-                                .entry(type_var_lhs.clone())
-                                .or_insert_with(Vec::new);
-                            impl_map.extend(implements.iter().cloned());
-                        }
-
                         for imp in type_variable_impls.get(type_var_lhs).cloned().unwrap_or_default() {
+                            println!("RECURSING {}", imp.func);
+                            let nested = add_match_constraints(
+                                solver,
+                                type_variables,
+                                type_variable_impls,
+                                &imp.func,
+                                &imp.method.params,
+                                Some(&*imp.method.ret),
+                                get_methods_by_name,
+                                true
+                            ).1;
+                            // Require: if this method is chosen then nested must hold
+                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
+                        }
+                        for imp in type_variable_impls.get(type_var_rhs).cloned().unwrap_or_default() {
                             println!("RECURSING {}", imp.func);
                             let nested = add_match_constraints(
                                 solver,
@@ -214,11 +255,11 @@ fn add_match_constraints<T>(
                     } else {
                         let lhs = Type::TypeVariable {
                             id: type_var_lhs.clone(),
-                            implements: type_variable_impls.get(type_var_lhs).cloned()
+                            implements: type_variable_impls.get(type_var_lhs).cloned().map(|x| x.into_iter().collect())
                         };
                         let rhs = Type::TypeVariable {
                             id: type_var_rhs.clone(),
-                            implements: type_variable_impls.get(type_var_rhs).cloned()
+                            implements: type_variable_impls.get(type_var_rhs).cloned().map(|x| x.into_iter().collect())
                         };
                         if !lhs.compatible(&rhs, false) {
                             // Exclude this method
@@ -305,11 +346,9 @@ pub fn resolve_method<T>(
     let mut type_variables = HashMap::new();
     let mut type_variable_impls = HashMap::new();
 
-    /*let freshened_func = Type::Method(MethodTy {
-        params: call_tys, ret: Box::new(Type::Unit)
-    });
-    let freshened_func = rename_tv_names(func_name.as_str(), freshened_func);
-    let call_tys = freshened_func.into_method().unwrap().params;*/
+    // let mut type_variable_impls = flatten_impls(&MethodTy {
+    //     params: call_tys.clone(), ret: Box::new(Type::Unit)
+    // });
 
     // Build constraints for `func` just like an `imp` resolution
     let (method_vars, sat) = add_match_constraints(
@@ -367,14 +406,20 @@ pub fn resolve_method<T>(
             if let Some(concrete_ty) = concrete_type_variables.get(type_var_name) {
                 concrete_ty.clone()
             } else {
-                unresolved_ret_ty
+                Type::TypeVariable {
+                    id: type_var_name.clone(),
+                    implements: type_variable_impls.get(type_var_name).cloned().map(|x| x.into_iter().collect())
+                }
             }
         },
         _ => unresolved_ret_ty
     };
 
     println!("TYPE VAR ASSIGNMENTS = {concrete_type_variables:?}");
-    println!(" - IMPLS = {type_variable_impls:?}");
+    println!(" - IMPLS");
+    for (k, v) in type_variable_impls {
+        println!("    - {k} {}", v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(", "));
+    }
     println!(" - RETURN TYPE = {ret_ty}");
 
     Ok(MethodResolution {

@@ -78,7 +78,12 @@ impl Type {
             ) => {
                 if let Some(imp_lhs) = imp_lhs {
                     if let Some(imp_rhs) = imp_rhs {
-                        todo!("TV advanced compatibility")
+                        for imp in imp_lhs {
+                            if !imp_rhs.contains(imp) {
+                                return false;
+                            }
+                        }
+                        true
                     } else {
                         false
                     }
@@ -199,6 +204,8 @@ impl Display for Type {
                         write!(f, "{i} ")?;
                     }
                     write!(f, "]>")?;
+                } else {
+                    write!(f, ">")?;
                 }
                 Ok(())
             },

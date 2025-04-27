@@ -263,6 +263,7 @@ fn add_match_constraints<T>(
                     // let type_var_id_rhs: SmolStr = format!("{type_var_rhs}__{:?}", inside_method.unwrap()).into();
 
                     // Bind the type variable to this TV type under this method
+                    /*println!("TVTV {param_ty} = {actual}");
                     let var_map = type_variables
                         .entry(type_var_lhs.clone())
                         .or_insert_with(HashMap::new);
@@ -273,7 +274,7 @@ fn add_match_constraints<T>(
                     solver.add_clause_reuse(&mut vec![
                         Lit::new(mvar, false),
                         Lit::new(*bind_var, true),
-                    ]);
+                    ]);*/
                     
                     // m -> unify lhs and rhs
                     if type_var_lhs != type_var_rhs {
@@ -300,6 +301,7 @@ fn add_match_constraints<T>(
 
         // Unify all pairs under m
         println!("UNIFYING {unify_pairs:?}");
+        // For each pair of TV
         for (lhs_id, rhs_id) in &unify_pairs {
             let mut lhs_map = type_variables.remove(lhs_id).unwrap_or(HashMap::new());
             let mut rhs_map = type_variables.remove(rhs_id).unwrap_or(HashMap::new());
@@ -307,6 +309,7 @@ fn add_match_constraints<T>(
             let mut all_tys: std::collections::HashSet<Type> = lhs_map.keys().cloned().collect();
             all_tys.extend(rhs_map.keys().cloned());
 
+            // For all possible TV type assignments
             for ty in all_tys {
                 println!(" - {ty}");
                 let var_lhs = lhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
@@ -419,11 +422,14 @@ pub fn resolve_method<T>(
 
     let chosen_method = chosen_method_ty.0.as_method().unwrap().0;
     let unresolved_ret_ty = (*chosen_method.ret).clone();
-    let ret_ty = match unresolved_ret_ty {
+    let ret_ty = match &unresolved_ret_ty {
         Type::TypeVariable { id: type_var_name, .. } => {
             // FIXME: If this panics, that means that we haven't resolved the return type
-            concrete_type_variables.get(&type_var_name)
-                .expect(&format!("Failed to find return type for {type_var_name}")).clone()
+            if let Some(concrete_ty) = concrete_type_variables.get(type_var_name) {
+                concrete_ty.clone()
+            } else {
+                unresolved_ret_ty
+            }
         },
         _ => unresolved_ret_ty
     };

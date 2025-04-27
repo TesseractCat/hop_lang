@@ -4,19 +4,19 @@ static {
     //def! identity [x: 'a] -> 'a { x };
     //def identitytwo (fn [x: 'a] -> 'a { x });
     //print (imp + Number Number -> Number);
-    //def addone (fn [x: '_ (imp identity ('_ (imp + Number Number -> '_)) -> '_)] -> Number { + x 1 });
 };
 //def! identity [x: 'a] -> 'a { x };
 //identity 5;
-def! addone [x: 'b (imp + 'b Number -> Number)] -> Number { + x 1 };
-addone 1;
-//identity "meow";
+//def! addone [x: 'b (imp identity ('b (imp + 'b Number -> Number)) -> 'b)] -> Number { identity x };
+//def! addone [x: 'b (imp identity 'b -> 'b)] -> Number { identity 1 };
+//addone 1;
 //def! test [x: 'a] -> String { + x "meow" };
+//identity "meow";
 //test 1;
 //def! foo [x: Number, y: String] -> Number { x };
 //def! bar [x: String, y: Number] -> Number { y };
 //def! testtwo [x: 'a (imp + 'a String -> String)] -> String { + x " meow hm" };
-//def! testthree [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+def! testthree [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
 //print (testtwo "ba");
 //print (identity (addone 1 2));
 

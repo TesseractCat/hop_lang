@@ -238,7 +238,7 @@ pub fn eval_call(
 
                 let res = eval(*body.clone(), env, new_env_key)?;
                 let res_ty = res.ty();
-                return if method_ret_ty.compatible(&res_ty) {
+                return if method_ret_ty.compatible(&res_ty, true) {
                     Ok(res)
                 } else {
                     Err(EvalError::TypeMismatch { expected: format!("{}", method_ret_ty), got: res_ty, span: body.tag.clone() })

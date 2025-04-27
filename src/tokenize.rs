@@ -40,7 +40,8 @@ impl ParseError {
 
 #[derive(Debug, Logos, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n\f]+")] // Ignore whitespace
-#[logos(skip r"//[^\r\n]*(\r\n|\n)?")] // Ignore comments
+#[logos(skip r"/\*(?:[^*]|\*[^/])*\*/")] // Multi-line comments
+#[logos(skip r"//[^\r\n]*(\r\n|\n)?")] // Single-line comments
 pub enum Token {
     #[token("{")]
     BlockOpen,
@@ -85,7 +86,7 @@ pub enum Token {
     })]
     String(SmolStr),
 
-    #[regex(r#"[a-zA-Z\-\/+=]+[a-zA-Z\-\/+_=!><]*"#, |lex| SmolStr::from(lex.slice()))]
+    #[regex(r#"[a-zA-Z=_\-\+]+[a-zA-Z\-\/+_=!><]*"#, |lex| SmolStr::from(lex.slice()))]
     Symbol(SmolStr),
     #[regex(r#":[a-zA-Z\-\/+_=]+[a-zA-Z\-\/+_=><]*"#, |lex| {
         let m = lex.slice();

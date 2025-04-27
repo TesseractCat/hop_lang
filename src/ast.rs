@@ -1,4 +1,4 @@
-use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, hash::Hash, io::empty, ops::Deref, rc::Rc};
+use std::{cell::{Ref, RefCell, RefMut}, collections::HashMap, fmt::{Debug, Display}, hash::Hash, io::empty, iter, ops::Deref, rc::Rc};
 
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
@@ -60,8 +60,66 @@ pub enum Type {
     Enum(Box<SpanNode>) // Table of {Tag: Type}
 }
 impl Type {
-    pub fn compatible(self: &Type, rhs: &Type) -> bool {
+    pub fn compatible(self: &Type, rhs: &Type, ignore_tv: bool) -> bool {
         // Compatibility such that rhs can be used in place of self/lhs
+        // At runtime, `ignore_tv` true makes all concrete types compatible with type variables
+        // because we assume that it has all been typechecked.
+
+        fn imp_eq_helper(a: &Implementation, b: &Implementation, tv_mappings: &mut HashMap<SmolStr, SmolStr>) -> bool {
+            if a.method.params.len() != b.method.params.len() { return false; }
+
+            for (a_ty, b_ty) in
+                a.method.params.iter().chain(iter::once(&*a.method.ret)).zip(
+                    b.method.params.iter().chain(iter::once(&*b.method.ret))
+                )
+            {
+                match (a_ty, b_ty) {
+                    (
+                        Type::TypeVariable { id: id_a, implements: implements_a },
+                        Type::TypeVariable { id: id_b, implements: implements_b },
+                    ) => {
+                        if tv_mappings.get(id_a).is_some_and(|v| v != id_b) || 
+                           tv_mappings.get(id_b).is_some_and(|v| v != id_a) { return false; }
+                        tv_mappings.insert(id_a.clone(), id_b.clone());
+                        tv_mappings.insert(id_b.clone(), id_a.clone());
+                        
+                        if let Some(implements_a) = implements_a {
+                            if let Some(implements_b) = implements_b {
+                                for imp_a in implements_a {
+                                    let mut exists_in_rhs = false;
+                                    for imp_b in implements_b {
+                                        if imp_eq_helper(imp_a, imp_b, tv_mappings) {
+                                            exists_in_rhs = true;
+                                            break;
+                                        }
+                                    }
+                                    if !exists_in_rhs { return false; }
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
+                    (_, _) => if a_ty != b_ty { return false; }
+                }
+            }
+            true
+        }
+        fn imp_eq(a: &[Implementation], b: &[Implementation]) -> bool {
+            let mut tv_mappings = HashMap::new();
+
+            for imp_a in a {
+                let mut exists_in_rhs = false;
+                for imp_b in b {
+                    if imp_eq_helper(imp_a, imp_b, &mut tv_mappings) {
+                        exists_in_rhs = true;
+                        break;
+                    }
+                }
+                if !exists_in_rhs { return false; }
+            }
+            true
+        }
 
         // Strict equality
         if self == rhs { return true; }
@@ -78,12 +136,7 @@ impl Type {
             ) => {
                 if let Some(imp_lhs) = imp_lhs {
                     if let Some(imp_rhs) = imp_rhs {
-                        for imp in imp_lhs {
-                            if !imp_rhs.contains(imp) {
-                                return false;
-                            }
-                        }
-                        true
+                        imp_eq(&imp_lhs, &imp_rhs)
                     } else {
                         false
                     }
@@ -91,6 +144,7 @@ impl Type {
                     true
                 }
             },
+            (Self::TypeVariable { .. }, _) | (_, Self::TypeVariable { .. }) if ignore_tv => true,
             (_, _) => false
             /*Self::Implements(imp_lhs) if matches!(rhs, Self::Implements(_)) => {
                 if let Self::Implements(imp_rhs) = rhs {

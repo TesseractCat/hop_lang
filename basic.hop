@@ -1,25 +1,22 @@
-static {
-    //def! test [x: imp (+ '_ '_ -> 'out), y: imp (+ '_ '_ -> 'out)] -> 'out { + x y };
-    //def! bar [x: imp (foo _ ? -> 'c)] -> 'c { x };
-    //def! identity [x: 'a] -> 'a { x };
-    //def identitytwo (fn [x: 'a] -> 'a { x });
-    //print (imp + Number Number -> Number);
-};
-//def! identity [x: 'a] -> 'a { x };
-//identity 5;
-//def! addone [x: 'b (imp identity ('b (imp + 'b Number -> Number)) -> 'b)] -> Number { identity x };
-//def! addone [x: 'b (imp identity 'b -> 'b)] -> Number { identity 1 };
-//addone 1;
-//def! test [x: 'a] -> String { + x "meow" };
-//identity "meow";
-//test 1;
-//def! foo [x: Number, y: String] -> Number { x };
-//def! bar [x: String, y: Number] -> Number { y };
-//def! testtwo [x: 'a (imp + 'a String -> String)] -> String { + x " meow hm" };
-def! testthree [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
-//print (testtwo "ba");
-//print (identity (addone 1 2));
+/*// Concrete types
+def! foo [x: Number, y: String] -> Number { x };
+print (foo 2 "hi");
 
-// x is a variable of type 'a, any 'a can be used with + like so: + 'a String -> String
-// y is a variable of type 'b, any 'b can be used with + like so: + 'b 'b -> 'b
-// - + 'b 1 won't work
+// Unconstrained generic
+def! identity [x: 'a] -> 'a { x };
+print (identity 5);
+print (identity "meow");
+
+// Function that returns generic
+def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+print (twice 3);
+
+// :eyes:
+//def! fourtimes [x: 'a (imp twice ('a (imp + 'a 'a -> 'a)) -> 'a)] -> 'a { twice (twice x) };
+//def! fourtimes [x: 'a (imp twice 'a -> 'a)] -> 'a { twice (twice x) };
+//print (fourtimes 5);*/
+
+// Shouldn't work
+def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+def! fourtimes [x: '_ (imp twice '_ -> '_)] -> '_ { twice (twice x) };
+print (+ (fourtimes 2) 2);

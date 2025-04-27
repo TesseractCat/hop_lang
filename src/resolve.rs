@@ -174,123 +174,62 @@ fn add_match_constraints<T>(
                             Lit::new(*bind_var, true),
                         ]);
                     } else {
+                        // Don't bind unless in imp context
                         solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                     }
-
-                    // println!("EXCLUDED! c <-> TV");
-                    // solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
-
-                    /*let (inside_method_idx, inside_method_var) = inside_method.unwrap_or((i, mvar));
-                    let type_var_id: SmolStr = if type_var_name == "_" {
-                        format!("anon{inside_method_idx}__{inside_method_var:?}").into()
-                    } else {
-                        format!("{type_var_name}__{inside_method_var:?}").into()
-                    };
-
-                    // Bind the type variable to this concrete type under this method
-                    let var_map = type_variables
-                        .entry(type_var_id.clone())
-                        .or_insert_with(HashMap::new);
-                    let bind_var = var_map
-                        .entry(concrete.clone())
-                        .or_insert_with(|| solver.new_var_default());
-                    // m -> binding_is_ty
-                    solver.add_clause_reuse(&mut vec![
-                        Lit::new(mvar, false),
-                        Lit::new(*bind_var, true),
-                    ]);
-
-                    println!("TVYOU {param_ty} | {actual}");
-                    // panic!("A type variable cannot be cast down to a concrete variable")
-                    let mut imp_vars: Vec<Var> = Vec::new();
-
-                    if let Some(implements_node) = implements {
-                        let (_, list) = implements_node.as_typed().unwrap();
-                        let implements = list.as_list().unwrap().borrow();
-                        let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-
-                        let impl_map = type_variable_impls
-                            .entry(type_var_id.clone())
-                            .or_insert_with(Vec::new);
-                        impl_map.extend(implements.cloned());
-                    }
-
-                    for imp in type_variable_impls.get(&type_var_id).cloned().unwrap_or_default() {
-                        if name == imp.func {
-                            //if imp.params.iter().chain(iter::once(&*imp.ret)).nth(i)
-                            // Substitute the type variable for the concrete type
-                            let substituted_imp_params: Vec<_> = imp.method.params.iter().map(|p| match p {
-                                Type::TypeVariable { id, .. } if id == type_var_name => concrete,
-                                _ => p
-                            }).cloned().collect();
-                            let substituted_ret_ty = match &*imp.method.ret {
-                                Type::TypeVariable { id, .. } if id == type_var_name => concrete,
-                                _ => &*imp.method.ret
-                            };
-                            println!("SUBS: {substituted_imp_params:?} {substituted_ret_ty}");
-                            // Issue is that if this fails to find a match, the whole SAT fails (because of the or later) !!!
-                            // fixed?
-                            let nested = add_match_constraints(
-                                solver,
-                                type_variables,
-                                type_variable_impls,
-                                name,
-                                substituted_imp_params.as_slice(),
-                                Some(substituted_ret_ty),
-                                // &imp.params,
-                                // Some(&*imp.ret),
-                                inside_method,
-                                get_methods_by_name
-                            ).1;
-                            imp_vars.push(nested);
-                        }
-                    }
-
-                    // m -> one of these
-                    println!("IV: {imp_vars:?}");
-                    let mut or_clause = imp_vars.into_iter()
-                        .map(|v| Lit::new(v, true)).collect::<Vec<_>>();
-                    or_clause.push(Lit::new(mvar, false));
-                    solver.add_clause_reuse(&mut or_clause);
-
-                    //solver.add_clause_reuse(&mut vec![Lit::new(mvar, true)]);*/
                 }
                 (
                     Type::TypeVariable { id: type_var_lhs, implements: implements_lhs },
                     Type::TypeVariable { id: type_var_rhs, implements: implements_rhs }
                 ) => {
-                    // let type_var_id_lhs: SmolStr = format!("{type_var_lhs}__{mvar:?}").into();
-                    // let type_var_id_rhs: SmolStr = format!("{type_var_rhs}__{:?}", inside_method.unwrap()).into();
-
-                    // Bind the type variable to this TV type under this method
-                    /*println!("TVTV {param_ty} = {actual}");
-                    let var_map = type_variables
-                        .entry(type_var_lhs.clone())
-                        .or_insert_with(HashMap::new);
-                    let bind_var = var_map
-                        .entry(Type::TypeVariable { id: type_var_rhs.clone(), implements: None })
-                        .or_insert_with(|| solver.new_var_default());
-                    // m -> binding_is_ty
-                    solver.add_clause_reuse(&mut vec![
-                        Lit::new(mvar, false),
-                        Lit::new(*bind_var, true),
-                    ]);*/
-                    
                     // m -> unify lhs and rhs
                     if type_var_lhs != type_var_rhs {
                         unify_pairs.push((type_var_lhs.clone(), type_var_rhs.clone()));
                     }
                     
-                    if !param_ty.compatible(actual) {
-                        // Exclude this method
-                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
-                        println!("EXCLUDED!!! {param_ty} vs. {actual}");
+                    println!(" === {param_ty} vs. {actual}");
+                    if inside_imp {
+                        if let Some(implements) = implements_lhs {
+                            let impl_map = type_variable_impls
+                                .entry(type_var_lhs.clone())
+                                .or_insert_with(Vec::new);
+                            impl_map.extend(implements.iter().cloned());
+                        }
+
+                        for imp in type_variable_impls.get(type_var_lhs).cloned().unwrap_or_default() {
+                            println!("RECURSING {}", imp.func);
+                            let nested = add_match_constraints(
+                                solver,
+                                type_variables,
+                                type_variable_impls,
+                                &imp.func,
+                                &imp.method.params,
+                                Some(&*imp.method.ret),
+                                get_methods_by_name,
+                                true
+                            ).1;
+                            // Require: if this method is chosen then nested must hold
+                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
+                        }
+                    } else {
+                        let lhs = Type::TypeVariable {
+                            id: type_var_lhs.clone(),
+                            implements: type_variable_impls.get(type_var_lhs).cloned()
+                        };
+                        let rhs = Type::TypeVariable {
+                            id: type_var_rhs.clone(),
+                            implements: type_variable_impls.get(type_var_rhs).cloned()
+                        };
+                        if !lhs.compatible(&rhs, false) {
+                            // Exclude this method
+                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                            println!("EXCLUDED!!! {param_ty} vs. {actual}");
+                        }
                     }
                 }
                 (lhs, rhs) => {
                     // Exclude mismatched concrete types
-                    // FIXME: Probably should use .compatible rather than != here?
-                    if !lhs.compatible(rhs) {
+                    if !lhs.compatible(rhs, false) {
                         // Exclude this method
                         solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                         println!("EXCLUDED!!! {lhs} vs. {rhs}");
@@ -328,12 +267,12 @@ fn add_match_constraints<T>(
     // solver.add_clause_reuse(
     //     &mut method_vars.keys().copied().map(|v| Lit::new(v, true)).collect()
     // );
-    let vars: Vec<Var> = method_vars.keys().copied().collect();
-    for i in 0..vars.len() {
-        for j in (i+1)..vars.len() {
-            solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
-        }
-    }
+    // let vars: Vec<Var> = method_vars.keys().copied().collect();
+    // for i in 0..vars.len() {
+    //     for j in (i+1)..vars.len() {
+    //         solver.add_clause_reuse(&mut vec![Lit::new(vars[i], false), Lit::new(vars[j], false)]);
+    //     }
+    // }
 
     // SAT var for "some method holds"
     let sat_var = solver.new_var_default();
@@ -385,7 +324,7 @@ pub fn resolve_method<T>(
     );
 
     // XOR(type variable bindings)
-    for tv_vars in type_variables.values().map(|v| v.values()) {
+    for tv_vars in type_variables.values().map(|v| v.values()).filter(|v| v.len() > 0) {
         solver.add_clause_reuse(
             &mut tv_vars.clone().copied().map(|v| Lit::new(v, true)).collect()
         );

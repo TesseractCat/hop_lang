@@ -138,7 +138,7 @@ impl Type {
                     if let Some(imp_rhs) = imp_rhs {
                         imp_eq(&imp_lhs, &imp_rhs)
                     } else {
-                        false
+                        imp_lhs.len() == 0
                     }
                 } else {
                     true

@@ -141,32 +141,6 @@ pub fn typecheck_call(
             .into_iter().cloned().map(|x| (x, ())).collect()
     };
     let call_tys = args.collect::<Vec<_>>();
-    // If we're checking if we can call a function, first check if any of the type variables
-    // have the correct implementations
-    /*for (i, ty) in call_tys.iter().enumerate() {
-        match ty {
-            Type::TypeVariable { id, implements } => {
-                println!("TYPE VARIABLE {id} | {implements:?}");
-                let mut good = false;
-                if let Some(implements_node) = implements {
-                    let (_, list) = implements_node.as_typed().unwrap();
-                    let implements = list.as_list().unwrap().borrow();
-                    let implements = implements.iter().map(|i| i.as_implementation().unwrap());
-                    for imp in implements {
-                        if imp.func == *func_symbol.as_symbol().unwrap() {
-                            good = true;
-                            // Need to restrict the function using arg/ret types
-                        }
-                    }
-                }
-                if !good {
-                    return Err(EvalError::NoMethodMatches { span: func_symbol.tag.clone() })
-                }
-            }
-            _ => (),
-        }
-    }*/
-    // If so, we're safe to search for a matching method
     resolve::resolve_method(func_symbol, call_tys, get_methods_by_name)
         .map(|x| x.ret_ty)
 }
@@ -250,7 +224,11 @@ pub fn typecheck(
                     let method_ty = Type::Method(MethodTy {
                         params: param_tys, ret: Box::new(ret_ty)
                     }, get_new_method_id());
-                    let method_ty = resolve::rename_tv_names(method_ty);
+                    let mut type_variable_impls = HashMap::new();
+                    let method_ty = resolve::flatten_impls(
+                        resolve::rename_tv_names(method_ty),
+                        &mut type_variable_impls
+                    );
 
                     // Recurse typecheck function body
                     {
@@ -258,13 +236,29 @@ pub fn typecheck(
                         let new_env_key = env.new_child(env_key);
                         for (param_name, param_ty) in param_names.iter().zip(method_ty.params.iter()) {
                             //println!("Setting function env {param_name} = {param_ty}");
-                            env.set(new_env_key, param_name.clone(), param_ty.clone(), true);
+                            let param_ty = match param_ty {
+                                Type::TypeVariable { id, .. } => Type::TypeVariable {
+                                    id: id.clone(),
+                                    implements: type_variable_impls.get(id).cloned().map(|x| x.into_iter().collect())
+                                },
+                                x => x.clone()
+                            };
+                            env.set(new_env_key, param_name.clone(), param_ty, true);
                         }
     
                         let body = list.next().unwrap();
                         let body_ty = typecheck(body, env, new_env_key)?;
-                        if !method_ty.ret.compatible(&body_ty, false) {
-                            return Err(EvalError::TypeMismatch { expected: format!("{}", method_ty.ret), got: body_ty, span: body.tag.clone() });
+
+                        let ret_ty = match &*method_ty.ret {
+                            Type::TypeVariable { id, .. } => &Type::TypeVariable {
+                                id: id.clone(),
+                                implements: type_variable_impls.get(id).cloned().map(|x| x.into_iter().collect())
+                            },
+                            x => x
+                        };
+
+                        if !ret_ty.compatible(&body_ty, false) {
+                            return Err(EvalError::TypeMismatch { expected: format!("{}", ret_ty), got: body_ty, span: body.tag.clone() });
                         }
                     }
 

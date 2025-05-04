@@ -46,7 +46,7 @@ pub fn rename_tv_names(method: Type) -> Type {
 
 /// Takes a method type, removes all TV implementations recursively,
 /// and collects them into a HashSet per TV.
-fn flatten_impls(
+fn flatten_impls_helper(
     method: &mut MethodTy,
     type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>
 ) {
@@ -54,7 +54,7 @@ fn flatten_impls(
         if let Type::TypeVariable { id, implements } = p {
             if let Some(implements) = implements {
                 for imp in implements.iter_mut() {
-                    flatten_impls(&mut imp.method, type_variable_impls);
+                    flatten_impls_helper(&mut imp.method, type_variable_impls);
                 }
             }
             type_variable_impls.entry(id.clone())
@@ -63,6 +63,26 @@ fn flatten_impls(
             let _ = mem::replace(implements, None);
         }
     }
+}
+pub fn flatten_impls(
+    method: Type,
+    type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>
+) -> Type {
+    let method_id = *method.as_method().unwrap().1;
+    let mut method_ty = method.into_method().unwrap().0;
+    flatten_impls_helper(&mut method_ty, type_variable_impls);
+    Type::Method(
+        method_ty,
+        method_id
+    )
+}
+
+struct ConstraintEnv<'a, MBN, T> where MBN: Fn(&str) -> Vec<(Type, T)> {
+    solver: &'a mut BasicSolver,
+    type_variables: &'a mut HashMap<SmolStr, HashMap<Type, Var>>,
+    type_variable_impls: &'a mut HashMap<SmolStr, HashSet<Implementation>>,
+    checked_impls: &'a mut HashSet<Implementation>,
+    get_methods_by_name: &'a MBN
 }
 
 /// Recursively build SAT constraints to select exactly one implementation of `name`
@@ -90,6 +110,8 @@ fn add_match_constraints<T>(
         type_var_name: &str
     ) {
         for imp in type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
+            // No need to recheck identical impls
+            // (this avoids infinite recursion)
             if !checked_impls.contains(&imp) {
                 checked_impls.insert(imp.clone());
                 println!("RECURSING {}", imp.func);
@@ -126,13 +148,11 @@ fn add_match_constraints<T>(
 
     // Create a SAT var per candidate
     let mut method_vars: HashMap<Var, (Type, Option<T>)> = HashMap::new();
-    for method in methods {
+    for mut method in methods {
         let v = solver.new_var_default();
 
         // FIXME: Flatten methods here?
-        let (mut method_ty, method_id) = method.0.into_method().unwrap();
-        flatten_impls(&mut method_ty, type_variable_impls);
-        let method = (Type::Method(method_ty, method_id), method.1);
+        method.0 = flatten_impls(method.0, type_variable_impls);
 
         method_vars.insert(v, (method.0, Some(method.1)));
     }
@@ -343,10 +363,11 @@ pub fn resolve_method<T>(
     let mut type_variable_impls = HashMap::new();
     let mut checked_impls = HashSet::new();
 
-    let mut method_ty = MethodTy {
+    let method_ty = MethodTy {
         params: call_tys, ret: Box::new(Type::Unit)
     };
-    flatten_impls(&mut method_ty, &mut type_variable_impls);
+    let method_ty = flatten_impls(Type::Method(method_ty, 0), &mut type_variable_impls)
+        .into_method().unwrap().0;
     let call_tys = method_ty.params;
 
     println!("Resolving '{func_name}':");

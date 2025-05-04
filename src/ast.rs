@@ -52,7 +52,7 @@ pub enum Type {
     Table(Box<Type>, Box<Type>),
 
     Function, // List of methods
-    Method(MethodTy, u64),
+    Method(MethodTy, u64), // Each method is assigned a unique id
     Macro,
     SpecialForm,
 

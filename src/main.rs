@@ -409,7 +409,7 @@ fn main() {
     }));
 
     // Static pass
-    println!("Running static pass...");
+    println!(" === Running static pass... === ");
     let tree = match eval_static(tree, &mut runtime_env, global_key) {
         Ok(t) => t,
         Err(e) => {
@@ -450,7 +450,7 @@ fn main() {
     }
 
     // Main pass
-    println!("Running main pass...");
+    println!(" === Running main pass... === ");
     let result = eval(tree, &mut runtime_env, global_key);
 
     match result {

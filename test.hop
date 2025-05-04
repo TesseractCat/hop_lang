@@ -1,3 +1,5 @@
 def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
+//twice true;
 def! fourtimes [x: 'a (imp twice ('a (imp + 'a String -> String)) -> 'a)] -> 'a { twice (twice x) };
-fourtimes 2;
+//def! fourtimes [x: 'a (imp twice 'a -> 'a)] -> 'a { twice (twice x) };
+fourtimes "meow"

@@ -1,9 +1,9 @@
-use std::{collections::{HashMap, HashSet}, iter};
+use std::{collections::{HashMap, HashSet}, iter, mem};
 
 use batsat::{intmap::AsIndex, lbool, BasicSolver, Lit, SolverInterface, Var};
 use smol_str::SmolStr;
 
-use crate::{ast::{Implementation, MethodTy, SpanNode, Type}, eval::EvalError};
+use crate::{ast::{Implementation, MethodTy, SpanNode, Type}, eval::EvalError, typecheck};
 
 fn rename_tv_names_helper(func: u64, mut method: MethodTy, idx: Option<usize>) -> MethodTy {
     for (i, ty) in method.params.iter_mut().chain(iter::once(&mut *method.ret)).enumerate() {
@@ -44,24 +44,25 @@ pub fn rename_tv_names(method: Type) -> Type {
     )
 }
 
-fn flatten_impls_helper(method: &MethodTy, dict: &mut HashMap<SmolStr, HashSet<Implementation>>) {
-    for p in &method.params {
+/// Takes a method type, removes all TV implementations recursively,
+/// and collects them into a HashSet per TV.
+fn flatten_impls(
+    method: &mut MethodTy,
+    type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>
+) {
+    for p in method.params.iter_mut().chain(iter::once(&mut *method.ret)) {
         if let Type::TypeVariable { id, implements } = p {
-            dict.entry(id.clone())
-                .or_insert_with(Default::default)
-                .extend(implements.as_ref().map(|x| x.as_slice()).unwrap_or(&[]).iter().cloned());
             if let Some(implements) = implements {
-                for imp in implements.iter() {
-                    flatten_impls_helper(&imp.method, dict);
+                for imp in implements.iter_mut() {
+                    flatten_impls(&mut imp.method, type_variable_impls);
                 }
             }
+            type_variable_impls.entry(id.clone())
+                .or_insert_with(Default::default)
+                .extend(implements.as_ref().map(|x| x.as_slice()).unwrap_or(&[]).iter().cloned());
+            let _ = mem::replace(implements, None);
         }
     }
-}
-pub fn flatten_impls(method: &MethodTy) -> HashMap<SmolStr, HashSet<Implementation>> {
-    let mut dict = HashMap::new();
-    flatten_impls_helper(method, &mut dict);
-    dict
 }
 
 /// Recursively build SAT constraints to select exactly one implementation of `name`
@@ -72,12 +73,43 @@ fn add_match_constraints<T>(
     solver: &mut BasicSolver,
     type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
     type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>,
+    checked_impls: &mut HashSet<Implementation>,
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
     get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>,
     inside_imp: bool
 ) -> (HashMap<Var, (Type, Option<T>)>, Var) {
+    fn recurse<T>(
+        solver: &mut BasicSolver,
+        type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
+        type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>,
+        checked_impls: &mut HashSet<Implementation>,
+        get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>,
+        mvar: Var,
+        type_var_name: &str
+    ) {
+        for imp in type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
+            if !checked_impls.contains(&imp) {
+                checked_impls.insert(imp.clone());
+                println!("RECURSING {}", imp.func);
+                let nested = add_match_constraints(
+                    solver,
+                    type_variables,
+                    type_variable_impls,
+                    checked_impls,
+                    &imp.func,
+                    &imp.method.params,
+                    Some(&*imp.method.ret),
+                    get_methods_by_name,
+                    true
+                ).1;
+                // Require: if this method is chosen then nested must hold
+                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
+            }
+        }
+    }
+
     println!("{name} | {call_tys:?} {call_ret_ty:?}");
     // Gather candidate methods
     let methods = get_methods_by_name(name)
@@ -96,21 +128,24 @@ fn add_match_constraints<T>(
     let mut method_vars: HashMap<Var, (Type, Option<T>)> = HashMap::new();
     for method in methods {
         let v = solver.new_var_default();
+
+        // FIXME: Flatten methods here?
+        let (mut method_ty, method_id) = method.0.into_method().unwrap();
+        flatten_impls(&mut method_ty, type_variable_impls);
+        let method = (Type::Method(method_ty, method_id), method.1);
+
         method_vars.insert(v, (method.0, Some(method.1)));
     }
 
-    let impls: Vec<Implementation> = call_tys.iter().filter_map(|ty| {
-        match ty {
-            Type::TypeVariable { implements: Some(implements), .. } => {
-                Some(implements.iter().cloned().collect::<Vec<_>>())
-            },
-            _ => None
-        }
-    }).flat_map(|x| x).collect();
-    for imp in impls {
-        if imp.func == name {
-            let v = solver.new_var_default();
-            method_vars.insert(v, (Type::Method(imp.method, 0), None));
+    // Basically, if we're actually calling a function, we can use imps as a source of truth
+    // otherwise we shouldn't
+    if !inside_imp {
+        let impls: Vec<Implementation> = type_variable_impls.iter().flat_map(|(_, hs)| hs).cloned().collect();
+        for imp in impls {
+            if imp.func == name {
+                let v = solver.new_var_default();
+                method_vars.insert(v, (Type::Method(imp.method, 0), None));
+            }
         }
     }
 
@@ -152,30 +187,16 @@ fn add_match_constraints<T>(
                         Lit::new(*bind_var, true),
                     ]);
 
-                    if let Type::TypeVariable { id, implements } = param_ty {
-                        if let Some(implements) = implements {
-                            let impl_map = type_variable_impls
-                                .entry(type_var_name.clone())
-                                .or_insert_with(Default::default);
-                            impl_map.extend(implements.iter().cloned());
-                        }
-
-                        for imp in type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
-                            println!("RECURSING {}", imp.func);
-                            let nested = add_match_constraints(
-                                solver,
-                                type_variables,
-                                type_variable_impls,
-                                &imp.func,
-                                &imp.method.params,
-                                Some(&*imp.method.ret),
-                                get_methods_by_name,
-                                true
-                            ).1;
-                            // Require: if this method is chosen then nested must hold
-                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                        }
-                    }
+                    println!("SHOULD I RECURSE? {type_var_name} {:?}", type_variable_impls.get(type_var_name));
+                    recurse(
+                        solver,
+                        type_variables,
+                        type_variable_impls,
+                        checked_impls,
+                        get_methods_by_name,
+                        mvar,
+                        &type_var_name
+                    );
                 },
                 (concrete, Type::TypeVariable { id: type_var_name, implements })
                 if !matches!(concrete, Type::TypeVariable { .. })
@@ -207,51 +228,26 @@ fn add_match_constraints<T>(
                         unify_pairs.push((type_var_lhs.clone(), type_var_rhs.clone()));
                     }
 
-                    if let Some(implements) = implements_lhs {
-                        let impl_map = type_variable_impls
-                            .entry(type_var_lhs.clone())
-                            .or_insert_with(Default::default);
-                        impl_map.extend(implements.iter().cloned());
-                    }
-                    if let Some(implements) = implements_rhs {
-                        let impl_map = type_variable_impls
-                            .entry(type_var_rhs.clone())
-                            .or_insert_with(Default::default);
-                        impl_map.extend(implements.iter().cloned());
-                    }
-                    
                     println!(" === {param_ty} vs. {actual}");
                     if inside_imp {
-                        for imp in type_variable_impls.get(type_var_lhs).cloned().unwrap_or_default() {
-                            println!("RECURSING {}", imp.func);
-                            let nested = add_match_constraints(
-                                solver,
-                                type_variables,
-                                type_variable_impls,
-                                &imp.func,
-                                &imp.method.params,
-                                Some(&*imp.method.ret),
-                                get_methods_by_name,
-                                true
-                            ).1;
-                            // Require: if this method is chosen then nested must hold
-                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                        }
-                        for imp in type_variable_impls.get(type_var_rhs).cloned().unwrap_or_default() {
-                            println!("RECURSING {}", imp.func);
-                            let nested = add_match_constraints(
-                                solver,
-                                type_variables,
-                                type_variable_impls,
-                                &imp.func,
-                                &imp.method.params,
-                                Some(&*imp.method.ret),
-                                get_methods_by_name,
-                                true
-                            ).1;
-                            // Require: if this method is chosen then nested must hold
-                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
-                        }
+                        recurse(
+                            solver,
+                            type_variables,
+                            type_variable_impls,
+                            checked_impls,
+                            get_methods_by_name,
+                            mvar,
+                            &type_var_lhs
+                        );
+                        recurse(
+                            solver,
+                            type_variables,
+                            type_variable_impls,
+                            checked_impls,
+                            get_methods_by_name,
+                            mvar,
+                            &type_var_rhs
+                        );
                     } else {
                         let lhs = Type::TypeVariable {
                             id: type_var_lhs.clone(),
@@ -345,16 +341,24 @@ pub fn resolve_method<T>(
     let mut solver = BasicSolver::default();
     let mut type_variables = HashMap::new();
     let mut type_variable_impls = HashMap::new();
+    let mut checked_impls = HashSet::new();
 
-    // let mut type_variable_impls = flatten_impls(&MethodTy {
-    //     params: call_tys.clone(), ret: Box::new(Type::Unit)
-    // });
+    let mut method_ty = MethodTy {
+        params: call_tys, ret: Box::new(Type::Unit)
+    };
+    flatten_impls(&mut method_ty, &mut type_variable_impls);
+    let call_tys = method_ty.params;
+
+    println!("Resolving '{func_name}':");
+    println!(" - CT: {call_tys:?}");
+    println!(" - TVI (for CTs): {type_variable_impls:?}");
 
     // Build constraints for `func` just like an `imp` resolution
     let (method_vars, sat) = add_match_constraints(
         &mut solver,
         &mut type_variables,
         &mut type_variable_impls,
+        &mut checked_impls,
         func_name,
         &call_tys,
         None,

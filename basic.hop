@@ -17,8 +17,8 @@ print (twice 3);*/
 //def! fourtimes [x: 'a (imp twice 'a -> 'a) (imp + 'a String -> String)] -> 'a { twice (twice x) };
 def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
 def! fourtimes [x: 'a (imp twice ('a (imp + 'a String -> String)) -> 'a)] -> 'a { twice (twice x) };
-print (fourtimes 5);
-+ 1 "hi";
+//print (fourtimes 5);
+//+ 1 "hi";
 
 // Shouldn't work
 //def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };

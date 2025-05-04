@@ -22,7 +22,7 @@ print (twice 3);
 // Shouldn't work
 def! twice [x: 'a (imp + 'a 'a -> 'a)] -> 'a { + x x };
 //def! fourtimes [x: '_ (imp twice '_ -> '_)] -> ('_ (imp + '_ Number -> Number)) { twice (twice x) };
-//def! fourtimes [x: 'b (imp twice 'b -> 'b)] -> ('b (imp + 'b Number -> Number)) { twice (twice x) };
-def! fourtimes [x: 'b (imp twice 'b -> 'b) (imp + 'b Number -> Number)] -> ('b (imp + 'b Number -> Number)) { twice (twice x) };
-print (fourtimes 1);
+def! fourtimes [x: 'b (imp twice 'b -> 'b)] -> ('b (imp + 'b Number -> Number)) { twice (twice x) };
+//def! fourtimes [x: 'b (imp twice 'b -> 'b) (imp + 'b Number -> Number)] -> ('b (imp + 'b Number -> Number)) { twice (twice x) };
+print (fourtimes 3);
 //print (+ (fourtimes 3) 2);

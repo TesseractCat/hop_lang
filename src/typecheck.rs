@@ -226,10 +226,12 @@ pub fn typecheck(
                     }, get_new_method_id());
                     let mut type_variable_impls = HashMap::new();
 
+                    let method_ty = resolve::rename_tv_names(method_ty);
+
                     // Recurse typecheck function body
                     {
                         let flattened_method_ty = resolve::flatten_impls(
-                            resolve::rename_tv_names(method_ty.clone()),
+                            method_ty.clone(),
                             &mut type_variable_impls
                         );
 

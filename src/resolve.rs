@@ -77,82 +77,70 @@ pub fn flatten_impls(
     )
 }
 
-struct ConstraintEnv<'a, MBN, T> where MBN: Fn(&str) -> Vec<(Type, T)> {
+struct ConstraintEnv<'a, F> {
     solver: &'a mut BasicSolver,
     type_variables: &'a mut HashMap<SmolStr, HashMap<Type, Var>>,
     type_variable_impls: &'a mut HashMap<SmolStr, HashSet<Implementation>>,
     checked_impls: &'a mut HashSet<Implementation>,
-    get_methods_by_name: &'a MBN
+    get_methods_by_name: &'a F
 }
 
 /// Recursively build SAT constraints to select exactly one implementation of `name`
 /// that takes as input the provided `call_tys`.
 /// Returns a map of method vars to their Types, and a fresh `sat_var`
 /// that is true iff some implementation holds.
-fn add_match_constraints<T>(
-    solver: &mut BasicSolver,
-    type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
-    type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>,
-    checked_impls: &mut HashSet<Implementation>,
+fn add_match_constraints<F: Fn(&str) -> Vec<(Type, T)>, T>(
+    env: &mut ConstraintEnv<F>,
     name: &str,
     call_tys: &[Type],
     call_ret_ty: Option<&Type>,
-    get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>,
     inside_imp: bool
 ) -> (HashMap<Var, (Type, Option<T>)>, Var) {
-    fn recurse<T>(
-        solver: &mut BasicSolver,
-        type_variables: &mut HashMap<SmolStr, HashMap<Type, Var>>,
-        type_variable_impls: &mut HashMap<SmolStr, HashSet<Implementation>>,
-        checked_impls: &mut HashSet<Implementation>,
-        get_methods_by_name: &impl Fn(&str) -> Vec<(Type, T)>,
+    fn recurse<F: Fn(&str) -> Vec<(Type, T)>, T>(
+        env: &mut ConstraintEnv<F>,
         mvar: Var,
         type_var_name: &str
     ) {
-        for imp in type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
+        for imp in env.type_variable_impls.get(type_var_name).cloned().unwrap_or_default() {
             // No need to recheck identical impls
             // (this avoids infinite recursion)
-            if !checked_impls.contains(&imp) {
-                checked_impls.insert(imp.clone());
+            if !env.checked_impls.contains(&imp) {
+                env.checked_impls.insert(imp.clone());
                 println!("RECURSING {}", imp.func);
                 let nested = add_match_constraints(
-                    solver,
-                    type_variables,
-                    type_variable_impls,
-                    checked_impls,
+                    env,
                     &imp.func,
                     &imp.method.params,
                     Some(&*imp.method.ret),
-                    get_methods_by_name,
                     true
                 ).1;
                 // Require: if this method is chosen then nested must hold
-                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
+                env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(nested, true)]);
             }
         }
     }
 
     println!("{name} | {call_tys:?} {call_ret_ty:?}");
     // Gather candidate methods
-    let methods = get_methods_by_name(name)
+    let methods = (env.get_methods_by_name)(name)
         .into_iter()
         // filter by arity
         .filter(|m| m.0.as_method().unwrap().0.params.len() == call_tys.len())
         //.map(|m| (rename_tv_names(m.0), m.1))
         .collect::<Vec<_>>();
     if methods.is_empty() {
-        let sat_var = solver.new_var_default();
-        solver.add_clause_reuse(&mut vec![Lit::new(sat_var, false)]);
+        let sat_var = env.solver.new_var_default();
+        env.solver.add_clause_reuse(&mut vec![Lit::new(sat_var, false)]);
         return (HashMap::new(), sat_var);
     }
 
     // Create a SAT var per candidate
     let mut method_vars: HashMap<Var, (Type, Option<T>)> = HashMap::new();
     for mut method in methods {
-        let v = solver.new_var_default();
+        let v = env.solver.new_var_default();
 
         // FIXME: Flatten methods here?
-        method.0 = flatten_impls(method.0, type_variable_impls);
+        method.0 = flatten_impls(method.0, env.type_variable_impls);
 
         method_vars.insert(v, (method.0, Some(method.1)));
     }
@@ -160,10 +148,10 @@ fn add_match_constraints<T>(
     // Basically, if we're actually calling a function, we can use imps as a source of truth
     // otherwise we shouldn't
     if !inside_imp {
-        let impls: Vec<Implementation> = type_variable_impls.iter().flat_map(|(_, hs)| hs).cloned().collect();
+        let impls: Vec<Implementation> = env.type_variable_impls.iter().flat_map(|(_, hs)| hs).cloned().collect();
         for imp in impls {
             if imp.func == name {
-                let v = solver.new_var_default();
+                let v = env.solver.new_var_default();
                 method_vars.insert(v, (Type::Method(imp.method, 0), None));
             }
         }
@@ -195,25 +183,21 @@ fn add_match_constraints<T>(
                     println!("TVUS {type_var_name} = {concrete}");
 
                     // Bind the type variable to this concrete type under this method
-                    let var_map = type_variables
+                    let var_map = env.type_variables
                         .entry(type_var_name.clone())
                         .or_insert_with(HashMap::new);
                     let bind_var = var_map
                         .entry(concrete.clone())
-                        .or_insert_with(|| solver.new_var_default());
+                        .or_insert_with(|| env.solver.new_var_default());
                     // m -> binding_is_ty
-                    solver.add_clause_reuse(&mut vec![
+                    env.solver.add_clause_reuse(&mut vec![
                         Lit::new(mvar, false),
                         Lit::new(*bind_var, true),
                     ]);
 
-                    println!("SHOULD I RECURSE? {type_var_name} {:?}", type_variable_impls.get(type_var_name));
+                    println!("SHOULD I RECURSE? {type_var_name} {:?}", env.type_variable_impls.get(type_var_name));
                     recurse(
-                        solver,
-                        type_variables,
-                        type_variable_impls,
-                        checked_impls,
-                        get_methods_by_name,
+                        env,
                         mvar,
                         &type_var_name
                     );
@@ -223,20 +207,20 @@ fn add_match_constraints<T>(
                 => {
                     // Bind the type variable to this concrete type under this method
                     if inside_imp {
-                        let var_map = type_variables
+                        let var_map = env.type_variables
                             .entry(type_var_name.clone())
                             .or_insert_with(HashMap::new);
                         let bind_var = var_map
                             .entry(concrete.clone())
-                            .or_insert_with(|| solver.new_var_default());
+                            .or_insert_with(|| env.solver.new_var_default());
                         // m -> binding_is_ty
-                        solver.add_clause_reuse(&mut vec![
+                        env.solver.add_clause_reuse(&mut vec![
                             Lit::new(mvar, false),
                             Lit::new(*bind_var, true),
                         ]);
                     } else {
                         // Don't bind unless in imp context
-                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                        env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                     }
                 }
                 (
@@ -251,35 +235,27 @@ fn add_match_constraints<T>(
                     println!(" === {param_ty} vs. {actual}");
                     if inside_imp {
                         recurse(
-                            solver,
-                            type_variables,
-                            type_variable_impls,
-                            checked_impls,
-                            get_methods_by_name,
+                            env,
                             mvar,
                             &type_var_lhs
                         );
                         recurse(
-                            solver,
-                            type_variables,
-                            type_variable_impls,
-                            checked_impls,
-                            get_methods_by_name,
+                            env,
                             mvar,
                             &type_var_rhs
                         );
                     } else {
                         let lhs = Type::TypeVariable {
                             id: type_var_lhs.clone(),
-                            implements: type_variable_impls.get(type_var_lhs).cloned().map(|x| x.into_iter().collect())
+                            implements: env.type_variable_impls.get(type_var_lhs).cloned().map(|x| x.into_iter().collect())
                         };
                         let rhs = Type::TypeVariable {
                             id: type_var_rhs.clone(),
-                            implements: type_variable_impls.get(type_var_rhs).cloned().map(|x| x.into_iter().collect())
+                            implements: env.type_variable_impls.get(type_var_rhs).cloned().map(|x| x.into_iter().collect())
                         };
                         if !lhs.compatible(&rhs, false) {
                             // Exclude this method
-                            solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                            env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                             println!("EXCLUDED!!! {param_ty} vs. {actual}");
                         }
                     }
@@ -288,7 +264,7 @@ fn add_match_constraints<T>(
                     // Exclude mismatched concrete types
                     if !lhs.compatible(rhs, false) {
                         // Exclude this method
-                        solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
+                        env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false)]);
                         println!("EXCLUDED!!! {lhs} vs. {rhs}");
                     }
                 }
@@ -299,8 +275,8 @@ fn add_match_constraints<T>(
         println!("UNIFYING {unify_pairs:?}");
         // For each pair of TV
         for (lhs_id, rhs_id) in &unify_pairs {
-            let mut lhs_map = type_variables.remove(lhs_id).unwrap_or(HashMap::new());
-            let mut rhs_map = type_variables.remove(rhs_id).unwrap_or(HashMap::new());
+            let mut lhs_map = env.type_variables.remove(lhs_id).unwrap_or(HashMap::new());
+            let mut rhs_map = env.type_variables.remove(rhs_id).unwrap_or(HashMap::new());
 
             let mut all_tys: std::collections::HashSet<Type> = lhs_map.keys().cloned().collect();
             all_tys.extend(rhs_map.keys().cloned());
@@ -308,15 +284,15 @@ fn add_match_constraints<T>(
             // For all possible TV type assignments
             for ty in all_tys {
                 println!(" - {ty}");
-                let var_lhs = lhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
-                let var_rhs = rhs_map.entry(ty.clone()).or_insert_with(|| solver.new_var_default());
+                let var_lhs = lhs_map.entry(ty.clone()).or_insert_with(|| env.solver.new_var_default());
+                let var_rhs = rhs_map.entry(ty.clone()).or_insert_with(|| env.solver.new_var_default());
                 // Enforce equivalence under mvar: var_lhs <-> var_rhs
-                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_lhs, false), Lit::new(*var_rhs, true)]);
-                solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_rhs, false), Lit::new(*var_lhs, true)]);
+                env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_lhs, false), Lit::new(*var_rhs, true)]);
+                env.solver.add_clause_reuse(&mut vec![Lit::new(mvar, false), Lit::new(*var_rhs, false), Lit::new(*var_lhs, true)]);
             }
 
-            type_variables.insert(lhs_id.clone(), lhs_map);
-            type_variables.insert(rhs_id.clone(), rhs_map);
+            env.type_variables.insert(lhs_id.clone(), lhs_map);
+            env.type_variables.insert(rhs_id.clone(), rhs_map);
         }
     }
 
@@ -332,15 +308,15 @@ fn add_match_constraints<T>(
     // }
 
     // SAT var for "some method holds"
-    let sat_var = solver.new_var_default();
+    let sat_var = env.solver.new_var_default();
     // sat_var -> OR(method_vars)
     let mut or_clause = method_vars.keys().copied()
         .map(|v| Lit::new(v, true)).collect::<Vec<_>>();
     or_clause.push(Lit::new(sat_var, false));
-    solver.add_clause_reuse(&mut or_clause);
+    env.solver.add_clause_reuse(&mut or_clause);
     // each method_var -> sat_var
     for &v in method_vars.keys() {
-        solver.add_clause_reuse(&mut vec![Lit::new(v, false), Lit::new(sat_var, true)]);
+        env.solver.add_clause_reuse(&mut vec![Lit::new(v, false), Lit::new(sat_var, true)]);
     }
 
     (method_vars, sat_var)
@@ -376,14 +352,16 @@ pub fn resolve_method<T>(
 
     // Build constraints for `func` just like an `imp` resolution
     let (method_vars, sat) = add_match_constraints(
-        &mut solver,
-        &mut type_variables,
-        &mut type_variable_impls,
-        &mut checked_impls,
+        &mut ConstraintEnv {
+            solver: &mut solver,
+            type_variables: &mut type_variables,
+            type_variable_impls: &mut type_variable_impls,
+            checked_impls: &mut checked_impls,
+            get_methods_by_name: &get_methods_by_name
+        },
         func_name,
         &call_tys,
         None,
-        &get_methods_by_name,
         false
     );
 

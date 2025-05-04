@@ -225,14 +225,15 @@ pub fn typecheck(
                         params: param_tys, ret: Box::new(ret_ty)
                     }, get_new_method_id());
                     let mut type_variable_impls = HashMap::new();
-                    let method_ty = resolve::flatten_impls(
-                        resolve::rename_tv_names(method_ty),
-                        &mut type_variable_impls
-                    );
 
                     // Recurse typecheck function body
                     {
-                        let method_ty = method_ty.as_method().unwrap().0;
+                        let flattened_method_ty = resolve::flatten_impls(
+                            resolve::rename_tv_names(method_ty.clone()),
+                            &mut type_variable_impls
+                        );
+
+                        let method_ty = flattened_method_ty.as_method().unwrap().0;
                         let new_env_key = env.new_child(env_key);
                         for (param_name, param_ty) in param_names.iter().zip(method_ty.params.iter()) {
                             //println!("Setting function env {param_name} = {param_ty}");

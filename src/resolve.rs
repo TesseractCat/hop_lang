@@ -79,9 +79,13 @@ pub fn flatten_impls(
 
 struct ConstraintEnv<'a, F> {
     solver: &'a mut BasicSolver,
+
     type_variables: &'a mut HashMap<SmolStr, HashMap<Type, Var>>,
     type_variable_impls: &'a mut HashMap<SmolStr, HashSet<Implementation>>,
+    unified_type_variables: &'a mut HashMap<(SmolStr, SmolStr), Var>,
+
     checked_impls: &'a mut HashSet<Implementation>,
+
     get_methods_by_name: &'a F
 }
 
@@ -229,7 +233,18 @@ fn add_match_constraints<F: Fn(&str) -> Vec<(Type, T)>, T>(
                 ) => {
                     // m -> unify lhs and rhs
                     if type_var_lhs != type_var_rhs {
-                        unify_pairs.push((type_var_lhs.clone(), type_var_rhs.clone()));
+                        // Submit to unify type variable values later
+                        let mut pair = [type_var_lhs.clone(), type_var_rhs.clone()];
+                        pair.sort();
+                        unify_pairs.push(pair.clone().into());
+
+                        // mvar -> these TV are unified
+                        let unified_var = *env.unified_type_variables.entry(pair.into())
+                            .or_insert_with(|| env.solver.new_var_default());
+                        env.solver.add_clause_reuse(&mut vec![
+                            Lit::new(mvar, false),
+                            Lit::new(unified_var, true),
+                        ]);
                     }
 
                     println!(" === {param_ty} vs. {actual}");
@@ -337,6 +352,7 @@ pub fn resolve_method<T>(
     let mut solver = BasicSolver::default();
     let mut type_variables = HashMap::new();
     let mut type_variable_impls = HashMap::new();
+    let mut unified_type_variables = HashMap::new();
     let mut checked_impls = HashSet::new();
 
     let method_ty = MethodTy {
@@ -356,6 +372,7 @@ pub fn resolve_method<T>(
             solver: &mut solver,
             type_variables: &mut type_variables,
             type_variable_impls: &mut type_variable_impls,
+            unified_type_variables: &mut unified_type_variables,
             checked_impls: &mut checked_impls,
             get_methods_by_name: &get_methods_by_name
         },
